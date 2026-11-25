@@ -1,40 +1,55 @@
 #!/bin/bash
 # ==============================================================================
-# GRE / GRETAP + Backhaul / FRP  Reverse Tunnel Manager  v4.0
+# GRE / GRETAP + Backhaul  Reverse Tunnel Manager  v5.0
 #
-#   Iran  server : TUN_IR_IP   <== GRE or GRETAP (MTU 1400 / MSS 1240) ==>   Kharej client : TUN_KH_IP
+#   Iran  server : TUN_IR_IP   <== GRE or GRETAP (MTU/MSS fixed, both sides) ==>   Kharej client : TUN_KH_IP
 #
 # Data path
-#   user -> Iran public IP:PORT --(iptables DNAT)--> TUN_IR_IP:PORT (core server)
-#        -> core control + data channels travel INSIDE the GRE/GRETAP link
-#        -> Kharej core client -> 127.0.0.1:TARGET_PORT on the Kharej box
+#   user -> Iran public IP:PORT --(iptables DNAT)--> TUN_IR_IP:PORT (Backhaul server)
+#        -> Backhaul control + data channels travel INSIDE the GRE/GRETAP link
+#        -> Backhaul client on Kharej -> 127.0.0.1:TARGET_PORT on the Kharej box
 #
-# New in v4.0 (everything from v3.0 is kept)
-#   1. Link type is chosen at setup: GRE (layer 3) or GRETAP (layer 2).
-#   2. Core is chosen at setup: Backhaul or FRP (frp v0.61.1, TOML config).
-#   3. Local tunnel IP pair is chosen at setup:
+# New in v5.0 (everything useful from v4.0 is kept)
+#   1. FRP core removed. Reason: FRP forces the SAME port list to be typed on
+#      BOTH servers (Iran AND Kharej), and any mismatch between the two breaks
+#      the tunnel. Backhaul only ever needed the port list on the Iran server
+#      (confirmed against Backhaul's own docs - "ports" is a server-only key,
+#      the client never declares ports), so this version is Backhaul-only:
+#      one source of truth (Iran), nothing to mistype on Kharej, fewer moving
+#      parts to break the server<->client connection.
+#   2. Connection profile is chosen at setup, same on both sides:
+#        gaming / fast / balance / turbo - tunes Backhaul's own keepalive,
+#        heartbeat, channel/mux buffer sizes, pool size and reconnect timers.
+#   3. MTU/MSS are now a single fixed pair (not tied to profile or protocol),
+#      so they are always identical on Iran and Kharej no matter which
+#      profile each admin happens to pick.
+#   4. Setup no longer blocks for up to 15-25 seconds waiting for the tunnel
+#      to come up: it does one instant check and hands control back; use
+#      menu option 3/4 a few seconds later to confirm (Restart=always keeps
+#      retrying in the background either way).
+#   5. Link type is chosen at setup: GRE (layer 3) or GRETAP (layer 2).
+#   6. Local tunnel IP pair is chosen at setup:
 #        1) 10.0.0.1 (Iran)     <-> 10.0.0.2 (Kharej)      /30
 #        2) 203.0.113.10 (Iran) <-> 203.0.113.20 (Kharej)  /27
-#      The core server<->client connection AND all tunneled traffic use that pair.
-#   4. Protocol is chosen manually, each core shows its own list:
-#        Backhaul : tcp tcpmux udp ws wsmux wss wssmux
-#        FRP      : tcp kcp quic websocket
-#   5. Forwarded ports are handled on the Iran server exactly like before
-#      (iptables DNAT to the tunnel IP + INPUT accept, tagged BHGT).
+#      The Backhaul server<->client connection AND all tunneled traffic use it.
+#   7. Protocol is chosen manually: tcp tcpmux udp ws wsmux wss wssmux.
+#   8. Forwarded ports are handled on the Iran server ONLY (iptables DNAT to
+#      the tunnel IP + INPUT accept, tagged BHGT) - Kharej is never asked.
 #
-# Things verified against the real binaries (Backhaul v0.7.2, frp 0.61.1)
+# Things verified against the real binary (Backhaul, Musixal/Backhaul docs)
+#   * "ports" is configured on the [server] (Iran) side only; the client
+#     never needs a port list - that was purely an FRP requirement.
 #   * Backhaul "udp" transport forwards UDP ports ONLY (no TCP listener).
 #   * Backhaul accept_udp (UDP-over-TCP) works with "tcp" but NOT with "tcpmux".
-#   * FRP needs the port list on BOTH sides (Iran: firewall + allowPorts,
-#     Kharej: the proxies), Backhaul needs it on the Iran side only.
-#   * Backhaul/FRP logs are colored: ANSI codes are stripped before matching.
+#   * Backhaul logs are colored: ANSI codes are stripped before matching.
 #
-# Upgrade note: config dir and service names of v3.x are kept on purpose, so an
-# existing v3.x tunnel is still shown by Status and replaced cleanly by Setup.
+# Upgrade note: config dir and service names of v3.x/v4.x are kept on purpose,
+# so an older install is still shown by Status and replaced cleanly by Setup.
+# Leftover frps/frpc services and binaries from a v4.0 FRP setup are removed
+# automatically the next time Setup (menu 1/2) or Uninstall (menu 9) runs.
 # ==============================================================================
 
-VERSION="4.0"
-FRP_VERSION="0.61.1"
+VERSION="5.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,15 +64,18 @@ TLS_CERT="$CONFIG_DIR/server.crt"
 TLS_KEY="$CONFIG_DIR/server.key"
 
 BACKHAUL_BIN="/usr/local/bin/backhaul-gretap"
-FRPS_BIN="/usr/local/bin/frps-gretap"
-FRPC_BIN="/usr/local/bin/frpc-gretap"
 LEGACY_BIN="/usr/local/bin/backhaul"
+# legacy (v4.0 FRP) paths - only used to clean up a previous FRP install, never written again
+LEGACY_FRPS_BIN="/usr/local/bin/frps-gretap"
+LEGACY_FRPC_BIN="/usr/local/bin/frpc-gretap"
+LEGACY_FRP_SVC="frp-tunnel.service"
 
 UNIT_DIR="/etc/systemd/system"
 LINK_SVC="gretap-tunnel.service"
 BACKHAUL_SVC="backhaul-tunnel.service"
-FRP_SVC="frp-tunnel.service"
 
+# MTU/MSS are fixed and NEVER change with protocol or profile, so they are
+# always identical on Iran and Kharej no matter what else differs.
 MSS_VAL="1240"
 MTU_VAL="1400"
 
@@ -66,23 +84,25 @@ IPSET_IR=("10.0.0.1"  "203.0.113.10")
 IPSET_KH=("10.0.0.2"  "203.0.113.20")
 IPSET_PFX=("30"       "27")
 
-# protocol lists, one per core
-BH_PROTOS=(tcp tcpmux udp ws wsmux wss wssmux)
-BH_DESCS=(
+# Backhaul transports
+PROTOS=(tcp tcpmux udp ws wsmux wss wssmux)
+PROTO_DESCS=(
     "plain TCP: lowest overhead, fastest in most cases (recommended)"
     "TCP + multiplexing: many small connections over few sockets"
-    "UDP transport: control over TCP, forwards UDP ports only (WireGuard, DNS, VoIP...)"
+    "UDP transport: forwards UDP ports only (games, VoIP, DNS, WireGuard...)"
     "WebSocket over TCP"
     "WebSocket + multiplexing"
     "WebSocket + TLS (a self-signed certificate is generated on the Iran server)"
     "WebSocket + TLS + multiplexing"
 )
-FRP_PROTOS=(tcp kcp quic websocket)
-FRP_DESCS=(
-    "TCP (+TLS, multiplexed): stable, best general choice (recommended)"
-    "KCP over UDP: tolerant to packet loss, uses more bandwidth"
-    "QUIC over UDP: fast (re)connect, good on lossy links"
-    "WebSocket over TCP"
+
+# connection profiles (must be the same on both servers)
+PROFILES=(gaming fast balance turbo)
+PROFILE_DESCS=(
+    "lowest ping/jitter: fast heartbeat, instant reconnect, small buffers"
+    "very high speed, still low latency/jitter, light overhead (recommended)"
+    "general purpose default - good all-round choice for everyday use"
+    "max throughput for downloads/transfers: big buffers, more pooled connections"
 )
 
 # ------------------------------------------------------------------------------
@@ -214,12 +234,13 @@ listener_conflicts() { # proto port
     done
 }
 
-# conflicts on the control port, depending on core + protocol
+# conflicts on the control port, depending on protocol
 ctrl_conflicts() {
     {
-        listener_conflicts tcp "$CTRL_PORT" | sed 's/^/tcp: /'
-        if [[ ( $CORE == frp && ( $PROTO == kcp || $PROTO == quic ) ) || ( $CORE == backhaul && $PROTO == udp ) ]]; then
+        if [[ $PROTO == udp ]]; then
             listener_conflicts udp "$CTRL_PORT" | sed 's/^/udp: /'
+        else
+            listener_conflicts tcp "$CTRL_PORT" | sed 's/^/tcp: /'
         fi
     } | sed '/^$/d'
 }
@@ -243,29 +264,16 @@ set_link_vars() {
     esac
 }
 
-set_core_vars() { # needs CORE + ROLE
-    case ${CORE:-backhaul} in
-        frp)
-            CORE=frp
-            CORE_NAME="FRP v$FRP_VERSION"
-            CORE_SVC=$FRP_SVC
-            LOG_OK_RE='login to server success'
-            LOG_ERR_RE='connect to server error|login to the server failed|\[E\]'
-            if [[ $ROLE == iran ]]; then
-                CORE_BIN=$FRPS_BIN; CORE_TAR_NAME="frps"; CORE_CONF="$CONFIG_DIR/frps.toml"; CORE_PROC="frps-gretap"
-            else
-                CORE_BIN=$FRPC_BIN; CORE_TAR_NAME="frpc"; CORE_CONF="$CONFIG_DIR/frpc.toml"; CORE_PROC="frpc-gretap"
-            fi
-            ;;
-        *)
-            CORE=backhaul
-            CORE_NAME="Backhaul"
-            CORE_SVC=$BACKHAUL_SVC
-            LOG_OK_RE='channel established'
-            LOG_ERR_RE='\[(ERROR|WARNING)\]'
-            CORE_BIN=$BACKHAUL_BIN; CORE_TAR_NAME="backhaul"; CORE_CONF="$CONFIG_DIR/config.toml"; CORE_PROC="backhaul-gretap"
-            ;;
-    esac
+set_core_vars() {
+    CORE=backhaul
+    CORE_NAME="Backhaul"
+    CORE_SVC=$BACKHAUL_SVC
+    LOG_OK_RE='channel established'
+    LOG_ERR_RE='\[(ERROR|WARNING)\]'
+    CORE_BIN=$BACKHAUL_BIN
+    CORE_TAR_NAME="backhaul"
+    CORE_CONF="$CONFIG_DIR/config.toml"
+    CORE_PROC="backhaul-gretap"
 }
 
 set_role_ips() {
@@ -278,13 +286,45 @@ set_role_ips() {
     fi
 }
 
-# which transport protocols of the forwarded ports are used (firewall + proxies)
+# which transport protocols of the forwarded ports are used (firewall)
 set_fwd_flags() {
     FWD_TCP=1
     FWD_UDP=0
-    case "$CORE:$PROTO" in
-        backhaul:udp)       FWD_TCP=0; FWD_UDP=1 ;;
-        backhaul:tcp|frp:*) FWD_UDP=${ACCEPT_UDP:-0} ;;
+    case "$PROTO" in
+        udp) FWD_TCP=0; FWD_UDP=1 ;;
+        tcp) FWD_UDP=${ACCEPT_UDP:-0} ;;
+    esac
+}
+
+# connection profile -> Backhaul tuning knobs. MTU/MSS are NOT part of this on
+# purpose (see MSS_VAL/MTU_VAL above) so they stay fixed no matter which
+# profile is picked on either side.
+set_profile_vars() {
+    case ${PROFILE:-balance} in
+        gaming)
+            PROFILE=gaming;   PROFILE_LABEL="Gaming (lowest ping/jitter)"
+            KEEPALIVE=20; HEARTBEAT=15; CHANNEL_SIZE=1024
+            MUX_CON=4;  MUX_FRAMESIZE=16384; MUX_RECVBUF=2097152; MUX_STREAMBUF=32768
+            POOL_COUNT=4;  AGGRESSIVE_POOL=false; DIAL_TIMEOUT=5;  RETRY_INTERVAL=1
+            ;;
+        fast)
+            PROFILE=fast;     PROFILE_LABEL="Fast (max speed, low latency)"
+            KEEPALIVE=40; HEARTBEAT=25; CHANNEL_SIZE=2048
+            MUX_CON=8;  MUX_FRAMESIZE=32768; MUX_RECVBUF=4194304; MUX_STREAMBUF=65536
+            POOL_COUNT=8;  AGGRESSIVE_POOL=false; DIAL_TIMEOUT=8;  RETRY_INTERVAL=2
+            ;;
+        turbo)
+            PROFILE=turbo;    PROFILE_LABEL="Turbo (max throughput)"
+            KEEPALIVE=90; HEARTBEAT=60; CHANNEL_SIZE=8192
+            MUX_CON=16; MUX_FRAMESIZE=65536; MUX_RECVBUF=8388608; MUX_STREAMBUF=131072
+            POOL_COUNT=16; AGGRESSIVE_POOL=true;  DIAL_TIMEOUT=15; RETRY_INTERVAL=5
+            ;;
+        *)
+            PROFILE=balance;  PROFILE_LABEL="Balance (general purpose)"
+            KEEPALIVE=75; HEARTBEAT=40; CHANNEL_SIZE=2048
+            MUX_CON=8;  MUX_FRAMESIZE=32768; MUX_RECVBUF=4194304; MUX_STREAMBUF=65536
+            POOL_COUNT=8;  AGGRESSIVE_POOL=false; DIAL_TIMEOUT=10; RETRY_INTERVAL=3
+            ;;
     esac
 }
 
@@ -296,6 +336,7 @@ save_conf() {
         echo "# generated by gre-tunnel-manager v$VERSION - edit via the menu"
         printf 'ROLE=%q\n'       "$ROLE"
         printf 'CORE=%q\n'       "$CORE"
+        printf 'PROFILE=%q\n'    "${PROFILE:-balance}"
         printf 'LINK_TYPE=%q\n'  "$LINK_TYPE"
         printf 'IFACE=%q\n'      "$IFACE"
         printf 'LOCAL_IP=%q\n'   "$LOCAL_IP"
@@ -326,8 +367,7 @@ load_conf() {
     # shellcheck disable=SC1090
     source "$CONF_FILE" || return 1
     [[ -n ${ROLE:-} ]] || return 1
-    # defaults / names used by v3.x so an old install is still understood
-    CORE=${CORE:-backhaul}
+    # defaults / names used by v3.x/v4.x so an old install is still understood
     LINK_TYPE=${LINK_TYPE:-gretap}
     CTRL_PORT=${CTRL_PORT:-${BH_PORT:-}}
     TOKEN=${TOKEN:-${BH_TOKEN:-}}
@@ -335,10 +375,12 @@ load_conf() {
     PFX=${PFX:-30}
     TUN_IR_IP=${TUN_IR_IP:-10.10.1.1}
     TUN_KH_IP=${TUN_KH_IP:-10.10.1.2}
+    PROFILE=${PROFILE:-balance}
     set_link_vars
     set_core_vars
     set_role_ips
     set_fwd_flags
+    set_profile_vars
     return 0
 }
 
@@ -354,19 +396,19 @@ write_backhaul_conf() {
             echo "transport = \"$PROTO\""
             if [[ ${ACCEPT_UDP:-0} == 1 && $PROTO == tcp ]]; then echo "accept_udp = true"; fi
             echo "token = \"$TOKEN\""
-            echo "keepalive_period = 75"
+            echo "keepalive_period = $KEEPALIVE"
             echo "nodelay = true"
-            echo "heartbeat = 40"
-            echo "channel_size = 2048"
+            echo "heartbeat = $HEARTBEAT"
+            echo "channel_size = $CHANNEL_SIZE"
             echo "sniffer = false"
             echo "log_level = \"info\""
             case $PROTO in
                 *mux)
-                    echo "mux_con = 8"
+                    echo "mux_con = $MUX_CON"
                     echo "mux_version = 1"
-                    echo "mux_framesize = 32768"
-                    echo "mux_recievebuffer = 4194304"
-                    echo "mux_streambuffer = 65536"
+                    echo "mux_framesize = $MUX_FRAMESIZE"
+                    echo "mux_recievebuffer = $MUX_RECVBUF"
+                    echo "mux_streambuffer = $MUX_STREAMBUF"
                     ;;
             esac
             case $PROTO in
@@ -385,84 +427,29 @@ write_backhaul_conf() {
             echo "remote_addr = \"$TUN_IR_IP:$CTRL_PORT\""
             echo "transport = \"$PROTO\""
             echo "token = \"$TOKEN\""
-            echo "connection_pool = 8"
-            echo "aggressive_pool = false"
-            echo "keepalive_period = 75"
-            echo "dial_timeout = 10"
-            echo "retry_interval = 3"
+            echo "connection_pool = $POOL_COUNT"
+            echo "aggressive_pool = $AGGRESSIVE_POOL"
+            echo "keepalive_period = $KEEPALIVE"
+            echo "dial_timeout = $DIAL_TIMEOUT"
+            echo "retry_interval = $RETRY_INTERVAL"
             echo "nodelay = true"
             echo "sniffer = false"
             echo "log_level = \"info\""
             case $PROTO in
                 *mux)
                     echo "mux_version = 1"
-                    echo "mux_framesize = 32768"
-                    echo "mux_recievebuffer = 4194304"
-                    echo "mux_streambuffer = 65536"
+                    echo "mux_framesize = $MUX_FRAMESIZE"
+                    echo "mux_recievebuffer = $MUX_RECVBUF"
+                    echo "mux_streambuffer = $MUX_STREAMBUF"
                     ;;
             esac
         fi
     } > "$CORE_CONF"
 }
 
-write_frp_conf() {
-    local m pub tgt sep=""
-    if [[ $ROLE == iran ]]; then
-        {
-            echo "# frps - generated by gre-tunnel-manager v$VERSION"
-            echo "bindAddr = \"$TUN_IR_IP\""
-            echo "bindPort = $CTRL_PORT"
-            case $PROTO in
-                kcp)  echo "kcpBindPort = $CTRL_PORT" ;;
-                quic) echo "quicBindPort = $CTRL_PORT" ;;
-            esac
-            echo "proxyBindAddr = \"$TUN_IR_IP\""
-            echo 'auth.method = "token"'
-            echo "auth.token = \"$TOKEN\""
-            echo 'transport.tcpMux = true'
-            echo 'transport.tcpMuxKeepaliveInterval = 30'
-            echo 'transport.heartbeatTimeout = 90'
-            echo 'log.to = "console"'
-            echo 'log.level = "info"'
-            printf 'allowPorts = [ '
-            for m in $PORTS; do
-                printf '%s{ single = %s }' "$sep" "${m%%=*}"
-                sep=", "
-            done
-            echo ' ]'
-        } > "$CORE_CONF"
-    else
-        {
-            echo "# frpc - generated by gre-tunnel-manager v$VERSION"
-            echo "serverAddr = \"$TUN_IR_IP\""
-            echo "serverPort = $CTRL_PORT"
-            echo 'loginFailExit = false'
-            echo 'auth.method = "token"'
-            echo "auth.token = \"$TOKEN\""
-            echo "transport.protocol = \"$PROTO\""
-            echo 'transport.tcpMux = true'
-            echo 'transport.tcpMuxKeepaliveInterval = 30'
-            echo 'transport.poolCount = 5'
-            echo 'transport.dialServerTimeout = 10'
-            echo 'transport.heartbeatInterval = 30'
-            echo 'transport.heartbeatTimeout = 90'
-            echo 'log.to = "console"'
-            echo 'log.level = "info"'
-            for m in $PORTS; do
-                pub=${m%%=*}
-                tgt=${m#*=}
-                printf '\n[[proxies]]\nname = "tcp-%s"\ntype = "tcp"\nlocalIP = "127.0.0.1"\nlocalPort = %s\nremotePort = %s\n' "$pub" "$tgt" "$pub"
-                if [[ ${FWD_UDP:-0} == 1 ]]; then
-                    printf '\n[[proxies]]\nname = "udp-%s"\ntype = "udp"\nlocalIP = "127.0.0.1"\nlocalPort = %s\nremotePort = %s\n' "$pub" "$tgt" "$pub"
-                fi
-            done
-        } > "$CORE_CONF"
-    fi
-}
-
 write_core_conf() {
     install -m 600 /dev/null "$CORE_CONF"
-    if [[ $CORE == frp ]]; then write_frp_conf; else write_backhaul_conf; fi
+    write_backhaul_conf
 }
 
 # ------------------------------------------------------------------------------
@@ -650,20 +637,17 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    # the core that is NOT in use must not start at boot
-    for s in "$BACKHAUL_SVC" "$FRP_SVC"; do
-        [[ $s == "$CORE_SVC" ]] && continue
-        systemctl disable "$s" >/dev/null 2>&1
-        rm -f "$UNIT_DIR/$s"
-    done
+    # clean up a leftover FRP install from v4.0, if any (one core now: Backhaul)
+    systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
+    rm -f "$UNIT_DIR/$LEGACY_FRP_SVC"
     systemctl daemon-reload
     systemctl enable "$LINK_SVC" "$CORE_SVC" >/dev/null 2>&1
 }
 
 stop_services() {
     local b
-    systemctl stop "$BACKHAUL_SVC" "$FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
-    for b in "$BACKHAUL_BIN" "$FRPS_BIN" "$FRPC_BIN"; do
+    systemctl stop "$BACKHAUL_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
+    for b in "$BACKHAUL_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"; do
         pkill -f -- "$b -c $CONFIG_DIR/" 2>/dev/null
     done
     return 0
@@ -764,12 +748,7 @@ show_bin_info() {
     echo "    version : $v"
     echo "    size    : $(stat -c %s "$CORE_BIN") bytes"
     echo "    sha256  : $(sha256sum "$CORE_BIN" | cut -d' ' -f1)"
-    if [[ $CORE == frp ]]; then
-        [[ $v == *"$FRP_VERSION"* ]] || warn "Expected FRP $FRP_VERSION but this binary reports '$v'."
-        warn "Iran (frps) and Kharej (frpc) should run the same FRP version."
-    else
-        warn "Iran and Kharej MUST run the same binary: compare the sha256 above on both servers."
-    fi
+    warn "Iran and Kharej MUST run the same binary: compare the sha256 above on both servers."
 }
 
 fetch_core_binary() { # [force]
@@ -786,11 +765,7 @@ fetch_core_binary() { # [force]
         aarch64|arm64) arch="arm64" ;;
         *) err "Unsupported architecture: $(uname -m)"; return 1 ;;
     esac
-    if [[ $CORE == frp ]]; then
-        url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${arch}.tar.gz"
-    else
-        url="https://github.com/Musixal/Backhaul/releases/latest/download/backhaul_linux_${arch}.tar.gz"
-    fi
+    url="https://github.com/Musixal/Backhaul/releases/latest/download/backhaul_linux_${arch}.tar.gz"
 
     tmp=$(mktemp) || return 1
     info "Downloading $url"
@@ -803,7 +778,7 @@ fetch_core_binary() { # [force]
     rm -f "$tmp"
     warn "GitHub download failed (blocked / offline?)."
 
-    if [[ $CORE == backhaul && -x $LEGACY_BIN ]] && is_elf "$LEGACY_BIN"; then
+    if [[ -x $LEGACY_BIN ]] && is_elf "$LEGACY_BIN"; then
         warn "Found an existing binary at $LEGACY_BIN (probably installed by another script)."
         if ask_yn "Copy and use it for this tunnel?" n; then
             if install_binary_file "$LEGACY_BIN"; then
@@ -865,59 +840,40 @@ choose_ipset() {
     PFX=${IPSET_PFX[c]}
 }
 
-choose_core() {
-    local c
-    echo
-    info "Tunnel core (must be the same on both servers):"
-    echo "   1) Backhaul        - protocols: ${BH_PROTOS[*]}"
-    echo "   2) FRP v$FRP_VERSION  - protocols: ${FRP_PROTOS[*]}"
-    MENU_MAX=2
-    ask_valid c "Select core" "1" valid_menu "Enter 1 or 2."
-    if (( 10#$c == 2 )); then CORE=frp; else CORE=backhaul; fi
-}
-
-choose_proto() { # needs CORE
-    local -a names=() descs=()
+choose_proto() {
     local i c
-    if [[ $CORE == frp ]]; then
-        names=("${FRP_PROTOS[@]}")
-        descs=("${FRP_DESCS[@]}")
-    else
-        names=("${BH_PROTOS[@]}")
-        descs=("${BH_DESCS[@]}")
-    fi
     echo
     info "$CORE_NAME protocol (must be the same on both servers):"
-    for i in "${!names[@]}"; do
-        printf '   %d) %-10s %s\n' $((i + 1)) "${names[i]}" "${descs[i]}"
+    for i in "${!PROTOS[@]}"; do
+        printf '   %d) %-10s %s\n' $((i + 1)) "${PROTOS[i]}" "${PROTO_DESCS[i]}"
     done
-    MENU_MAX=${#names[@]}
+    MENU_MAX=${#PROTOS[@]}
     ask_valid c "Select protocol" "1" valid_menu "Enter a number from 1 to $MENU_MAX."
-    PROTO=${names[$((10#$c - 1))]}
+    PROTO=${PROTOS[$((10#$c - 1))]}
 }
 
-choose_role() {
-    local c
-    echo "   1) IRAN server    2) KHAREJ client"
-    MENU_MAX=2
-    ask_valid c "Role" "1" valid_menu "Enter 1 or 2."
-    if (( 10#$c == 2 )); then ROLE=kharej; else ROLE=iran; fi
+choose_profile() {
+    local i c
+    echo
+    info "Connection profile (must be the same on both servers):"
+    for i in "${!PROFILES[@]}"; do
+        printf '   %d) %-9s %s\n' $((i + 1)) "${PROFILES[i]}" "${PROFILE_DESCS[i]}"
+    done
+    MENU_MAX=${#PROFILES[@]}
+    ask_valid c "Select profile" "2" valid_menu "Enter a number from 1 to $MENU_MAX."
+    PROFILE=${PROFILES[$((10#$c - 1))]}
+    set_profile_vars
 }
 
-prompt_ports() {
+prompt_ports() { # Iran server only - Kharej is never asked for a port list
     local raw m pub conflicts msg
     while true; do
-        if [[ $ROLE == iran ]]; then
-            msg="Ports to forward (e.g. 1080,443  -  use 8443=443 for public 8443 -> Kharej 443)"
-        else
-            msg="Ports to expose - the SAME list as on the Iran server (A=B: Iran port A -> a service on THIS server's port B)"
-        fi
+        msg="Ports to forward (e.g. 1080,443  -  use 8443=443 for public 8443 -> Kharej 443)"
         ask raw "$msg" ""
         if ! parse_ports "$raw"; then
             err "Enter at least one valid port."
             continue
         fi
-        [[ $ROLE == iran ]] || return 0
         conflicts=""
         for m in "${PORT_MAP[@]}"; do
             pub=${m%%=*}
@@ -942,7 +898,8 @@ print_summary() {
     echo -e "${CYAN}--------------- configuration summary ($ROLE) ---------------${NC}"
     echo "  Link      : $LINK_LABEL ($IFACE)   public IPs: this $LOCAL_IP <-> peer $REMOTE_IP"
     echo "  Tunnel IPs: Iran $TUN_IR_IP <-> Kharej $TUN_KH_IP (/$PFX)   this server: $SELF_IP"
-    echo "  Core      : $CORE_NAME   protocol: $PROTO"
+    echo "  Core      : $CORE_NAME   protocol: $PROTO   profile: $PROFILE_LABEL"
+    echo "  MTU/MSS   : $MTU_VAL / $MSS_VAL (fixed, same regardless of profile)"
     echo "  Control   : $TUN_IR_IP:$CTRL_PORT (inside the tunnel)"
     echo "  Token     : $TOKEN"
     if [[ -n ${PORTS:-} ]]; then
@@ -968,11 +925,11 @@ setup_tunnel() { # iran | kharej
 
     choose_link
     choose_ipset
-    choose_core
     set_link_vars
     set_core_vars
     set_role_ips
     choose_proto
+    choose_profile
 
     echo
     def_ip=$(detect_ip)
@@ -984,7 +941,6 @@ setup_tunnel() { # iran | kharej
     fi
 
     def_port=3080
-    [[ $CORE == frp ]] && def_port=7000
     while true; do
         ask_valid CTRL_PORT "$CORE_NAME control port (reached INSIDE the tunnel)" "$def_port" valid_port "Port must be 1-65535."
         [[ $ROLE == iran ]] || break
@@ -1001,18 +957,13 @@ setup_tunnel() { # iran | kharej
 
     ACCEPT_UDP=0
     PORTS=""
-    if [[ $CORE == backhaul && $PROTO == tcp ]]; then
+    if [[ $PROTO == tcp ]]; then
         ask_yn "Also forward UDP on those ports (Backhaul UDP-over-TCP)? (same answer on both servers)" n && ACCEPT_UDP=1
-    elif [[ $CORE == frp ]]; then
-        ask_yn "Also forward UDP on those ports (native FRP UDP proxies)? (same answer on both servers)" n && ACCEPT_UDP=1
-    elif [[ $CORE == backhaul && $PROTO == udp ]]; then
+    elif [[ $PROTO == udp ]]; then
         info "Backhaul 'udp' transport forwards UDP ports only (no TCP)."
     fi
     set_fwd_flags
-    if [[ $ROLE == iran || $CORE == frp ]]; then
-        if [[ $CORE == frp && $ROLE == kharej ]]; then
-            warn "FRP: the Kharej client defines the proxies, so the port list is needed here too (must match the Iran server)."
-        fi
+    if [[ $ROLE == iran ]]; then
         prompt_ports
         PORTS="${PORT_MAP[*]}"
     fi
@@ -1020,13 +971,17 @@ setup_tunnel() { # iran | kharej
     ask_yn "Apply this configuration now?" y || { warn "Aborted - nothing was changed."; return 1; }
 
     fetch_core_binary 0 || { err "Cannot continue without the $CORE_NAME binary."; return 1; }
-    if [[ $ROLE == iran && ( $PROTO == wss || $PROTO == wssmux ) && $CORE == backhaul ]]; then
+    if [[ $ROLE == iran && ( $PROTO == wss || $PROTO == wssmux ) ]]; then
         ensure_tls_cert || return 1
     fi
 
     start_ts=$(date '+%Y-%m-%d %H:%M:%S')
     info "Stopping old services (their own stop hooks remove old firewall rules)..."
     stop_services
+    # one-time cleanup of a v4.0 FRP install, if this box ever had one
+    systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
+    rm -f "$UNIT_DIR/$LEGACY_FRP_SVC" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"
+    systemctl daemon-reload
     rm -f "$CONFIG_DIR/gretap-up.sh" "$CONFIG_DIR/gretap-down.sh" \
           "$CONFIG_DIR/config.toml" "$CONFIG_DIR/frps.toml" "$CONFIG_DIR/frpc.toml"
 
@@ -1047,10 +1002,8 @@ setup_tunnel() { # iran | kharej
 
     echo
     echo -e "${CYAN}Enter the SAME values on the other server:${NC}"
-    echo "  link type: $LINK_TYPE | IP pair: $TUN_IR_IP / $TUN_KH_IP | core: $CORE | protocol: $PROTO | control port: $CTRL_PORT | token: $TOKEN"
-    if [[ $CORE == frp ]]; then
-        echo "  ports (FRP needs them on BOTH servers): ${PORTS// /,}   UDP: $([[ ${FWD_UDP:-0} == 1 ]] && echo yes || echo no)"
-    fi
+    echo "  link type: $LINK_TYPE | IP pair: $TUN_IR_IP / $TUN_KH_IP | protocol: $PROTO | profile: $PROFILE | control port: $CTRL_PORT | token: $TOKEN"
+    info "The forwarded port list is only ever entered on the IRAN server - Kharej does not need it."
     if [[ $ROLE == kharej ]]; then
         echo
         warn "The core forwards every tunneled port to 127.0.0.1:<target port> ON THIS (Kharej) MACHINE."
@@ -1070,89 +1023,33 @@ ctrl_ok() {
     local tcp udp
     tcp=$(ss -H -ltnp "sport = :$CTRL_PORT" 2>/dev/null | grep -c "$CORE_PROC")
     udp=$(ss -H -lunp "sport = :$CTRL_PORT" 2>/dev/null | grep -c "$CORE_PROC")
-    case "$CORE:$PROTO" in
-        frp:kcp|frp:quic)  (( tcp > 0 && udp > 0 )) ;;
-        *)                 (( tcp > 0 )) ;;   # backhaul "udp": control channel is TCP, UDP listener appears after the client connects
-    esac
+    if [[ $PROTO == udp ]]; then (( udp > 0 )); else (( tcp > 0 )); fi
 }
 
-# Backhaul "udp" transport: the server opens its UDP listener only AFTER the control channel is up.
-# On a very fast link the client's first UDP packets can arrive too early ("connection refused") and its
-# UDP workers stop. Restarting the client once (the server is ready by then) fixes it.
-udp_client_settle() {
-    local ts
-    sleep 3
-    if ! core_log 100 | grep -q "failed to receive response from server"; then
-        res ok "UDP data path looks healthy"
-        return 0
-    fi
-    warn "Backhaul udp: the client raced the server's UDP listener - restarting the client once."
-    ts=$(date '+%Y-%m-%d %H:%M:%S')
-    systemctl restart "$CORE_SVC"
-    sleep 5
-    if core_log 100 "$ts" | grep -q "failed to receive response from server"; then
-        res bad "UDP data path still failing - run Diagnose, then restart the client (menu 6)"
-        return 1
-    fi
-    res ok "UDP data path is up after the restart"
-}
-
-verify_frp_proxies() { # since
-    local ts=$1 want n=0 i log bad
-    want=$(( $(wc -w <<< "$PORTS") * (1 + ${FWD_UDP:-0}) ))
-    for i in $(seq 1 10); do
-        log=$(core_log 300 "$ts")
-        n=$(grep -c "start proxy success" <<< "$log")
-        (( n >= want )) && break
-        sleep 1
-    done
-    if (( n >= want )); then
-        res ok "$n/$want FRP proxies registered on the Iran server"
-        return 0
-    fi
-    res bad "only $n/$want FRP proxies registered"
-    bad=$(grep "start error" <<< "$log" | tail -n 4)
-    [[ -n $bad ]] && echo "$bad" | sed 's/^/        /'
-    if grep -q "port not allowed" <<< "$bad"; then
-        echo "    -> 'port not allowed': the port list on the Iran server differs from this one (update ports on the IRAN server: menu 5)."
-    elif grep -q "already used" <<< "$bad"; then
-        echo "    -> 'already used': another program on the Iran server owns that port."
-    fi
-    return 1
-}
-
+# instant check, no blocking wait: systemd (Restart=always) keeps retrying on
+# its own in the background regardless, so Setup hands control back right away
+# instead of sitting idle for up to 15-25 seconds like older versions did.
 verify_setup() { # start_ts
-    local ts=$1 i log errs
+    local ts=$1 log
     echo
-    info "Verifying (up to 25 s)..."
+    info "Quick check (no wait - keep an eye on menu option 3 / 4 if this isn't confirmed yet)..."
     if [[ $ROLE == iran ]]; then
-        for i in $(seq 1 15); do
-            if systemctl is-active -q "$CORE_SVC" && ctrl_ok; then
-                res ok "$CORE_NAME server is listening on $TUN_IR_IP:$CTRL_PORT ($PROTO)"
-                return 0
-            fi
-            sleep 1
-        done
-        res bad "$CORE_NAME server is NOT listening on port $CTRL_PORT"
-        core_log 15 "$ts" | tail -n 15
-        echo "    -> run menu option 4 (Diagnose) to see who owns the port / why it exits."
-        return 1
-    fi
-
-    for i in $(seq 1 25); do
-        log=$(core_log 300 "$ts")
-        if grep -qiE "$LOG_OK_RE" <<< "$log"; then
-            res ok "Control channel established with $TUN_IR_IP:$CTRL_PORT"
-            [[ $CORE == frp ]] && verify_frp_proxies "$ts"
-            [[ $CORE == backhaul && $PROTO == udp ]] && udp_client_settle
+        if systemctl is-active -q "$CORE_SVC" && ctrl_ok; then
+            res ok "$CORE_NAME server is listening on $TUN_IR_IP:$CTRL_PORT ($PROTO)"
             return 0
         fi
-        sleep 1
-    done
-    errs=$(grep -cE "$LOG_ERR_RE" <<< "$log")
-    if (( errs > 0 )); then
-        res bad "Control channel NOT established. Last messages:"
-        grep -E "$LOG_ERR_RE" <<< "$log" | tail -n 6 | sed 's/^/        /'
+        res warn "Not confirmed yet - the service keeps retrying in the background. Check again in a few seconds (menu 3 / 4)."
+        return 0
+    fi
+
+    log=$(core_log 300 "$ts")
+    if grep -qiE "$LOG_OK_RE" <<< "$log"; then
+        res ok "Control channel established with $TUN_IR_IP:$CTRL_PORT"
+        return 0
+    fi
+    if grep -qE "$LOG_ERR_RE" <<< "$log"; then
+        res warn "Last log line(s) below - the client keeps retrying automatically:"
+        grep -E "$LOG_ERR_RE" <<< "$log" | tail -n 3 | sed 's/^/        /'
         if grep -qi "refused" <<< "$log"; then
             echo "    -> 'connection refused': the Iran $CORE_NAME server is not running/listening on $TUN_IR_IP:$CTRL_PORT."
         elif grep -qi "token" <<< "$log"; then
@@ -1165,9 +1062,9 @@ verify_setup() { # start_ts
         elif grep -qiE "timeout|timed out" <<< "$log"; then
             echo "    -> timeouts: packets get lost inside the tunnel (MTU / GRE filtering). Run Diagnose."
         fi
-        return 1
+    else
+        res warn "No result yet - check again with menu option 3 / 4 in a few seconds."
     fi
-    res warn "No result yet - check again with menu option 3 / 4 in a few seconds."
     return 0
 }
 
@@ -1193,7 +1090,8 @@ show_status() {
     echo -e "\n${CYAN}================ TUNNEL STATUS ($ROLE) ================${NC}"
     echo "  Link       : $LINK_LABEL ($IFACE)   public: local $LOCAL_IP <-> peer $REMOTE_IP"
     echo "  Tunnel IPs : $SELF_IP <-> $PEER_IP (/$PFX)"
-    echo "  Core       : $CORE_NAME   protocol: $PROTO   control: $TUN_IR_IP:$CTRL_PORT"
+    echo "  Core       : $CORE_NAME   protocol: $PROTO   profile: $PROFILE_LABEL"
+    echo "  Control    : $TUN_IR_IP:$CTRL_PORT   MTU/MSS: $MTU_VAL/$MSS_VAL (fixed)"
     if [[ -n ${PORTS:-} ]]; then
         echo "  Forwarded  : $PORTS   (TCP: $([[ $FWD_TCP == 1 ]] && echo yes || echo no), UDP: $([[ $FWD_UDP == 1 ]] && echo yes || echo no))"
     fi
@@ -1317,7 +1215,7 @@ diagnose() {
                 elif [[ -n $(ss $fl "sport = :$pub" 2>/dev/null) ]]; then
                     res bad "$proto port $pub is held by another program: $(ss $fl "sport = :$pub" | awk '{print $6}' | head -n1)"
                 else
-                    res warn "nothing listens on $proto $pub yet (normal until the Kharej client has connected$([[ $CORE == frp ]] && echo ' and registered this port'))"
+                    res warn "nothing listens on $proto $pub yet (normal until the Kharej client has connected)"
                 fi
             done
         done
@@ -1327,6 +1225,8 @@ diagnose() {
         state=$(client_state)
         if [[ $state == up ]]; then
             res ok "Tunnel is established (client log); skipping the raw probe so it cannot disturb live traffic"
+        elif [[ $PROTO == udp ]]; then
+            res warn "UDP transport cannot be probed with a plain TCP connect - read the client log below"
         else
             timeout 3 bash -c "exec 3<>/dev/tcp/$PEER_IP/$CTRL_PORT" 2>/dev/null
             rc=$?
@@ -1335,21 +1235,6 @@ diagnose() {
                 124) res bad "TCP connect to $PEER_IP:$CTRL_PORT TIMED OUT (packets dropped inside the tunnel: MTU/firewall)" ;;
                 *)   res bad "TCP connect to $PEER_IP:$CTRL_PORT REFUSED: nothing listens there (Iran $CORE_NAME not running / different port)" ;;
             esac
-        fi
-        if [[ $CORE == frp ]]; then
-            echo -e "\n${CYAN}5) FRP proxies${NC}"
-            local started bad
-            started=$(core_log 300 | grep -c "start proxy success")
-            bad=$(core_log 300 | grep "start error" | tail -n 3)
-            if [[ -n $bad ]]; then
-                res bad "some proxies failed to start:"
-                echo "$bad" | sed 's/^/        /'
-                echo "      -> 'port not allowed' = the port list on the Iran server differs from this one."
-            elif (( started > 0 )); then
-                res ok "$started proxy start message(s) in the recent log"
-            else
-                res warn "no proxy has been started yet (not logged in?)"
-            fi
         fi
         echo
         if ask_yn "Test local target ports on this Kharej server? (e.g. is your SOCKS/Xray listening)" n; then
@@ -1382,17 +1267,9 @@ diagnose() {
     core_log 12 | sed 's/^/    /'
 
     echo -e "\n${CYAN}How to read common errors${NC}"
-    if [[ $CORE == frp ]]; then
-        echo "    'connect to server error ... refused/timeout' : frps is not reachable (service down, wrong control port, or the link is down)."
-        echo "    'token in login doesn't match'                : different tokens on the two servers."
-        echo "    'port not allowed'                            : the port list differs between Iran and Kharej (FRP needs it on both)."
-    else
-        echo "    'failed to receive response from server ... refused' (udp protocol): the client sent UDP before the Iran UDP"
-        echo "    listener was ready -> restart the Kharej client (menu 6)."
-        echo "    'failed to read message length ... EOF' on the Kharej client: the TCP connection worked, then the other end"
-        echo "    closed it at once. With matching tokens the thing answering is not your Backhaul server (port owner, see Iran"
-        echo "    step 4), uses another protocol, or is a different Backhaul build (compare sha256 in step 1 on both servers)."
-    fi
+    echo "    'failed to read message length ... EOF' on the Kharej client: the TCP connection worked, then the other end"
+    echo "    closed it at once. With matching tokens the thing answering is not your Backhaul server (port owner, see Iran"
+    echo "    step 4), uses another protocol, or is a different Backhaul build (compare sha256 in step 1 on both servers)."
     echo -e "${CYAN}======================================================${NC}\n"
 }
 
@@ -1401,14 +1278,11 @@ diagnose() {
 # ------------------------------------------------------------------------------
 update_ports() {
     load_conf || { err "Not configured yet."; return 1; }
-    if [[ $ROLE != iran && $CORE != frp ]]; then
-        err "Backhaul forwarded ports are configured on the IRAN server only."
+    if [[ $ROLE != iran ]]; then
+        err "Forwarded ports are configured on the IRAN server only - nothing to update here on Kharej."
         return 1
     fi
     info "Current forwarded ports: ${PORTS:-none}"
-    if [[ $CORE == frp ]]; then
-        warn "FRP: enter the SAME port list on BOTH servers (Iran: firewall + allowPorts, Kharej: proxies)."
-    fi
     prompt_ports
     PORTS="${PORT_MAP[*]}"
     save_conf
@@ -1428,9 +1302,6 @@ binary_menu() {
     local configured=1
     if ! load_conf; then
         configured=0
-        info "No tunnel configured yet - choose which binary to inspect/install."
-        choose_core
-        choose_role
         set_core_vars
     fi
     echo
@@ -1456,18 +1327,18 @@ uninstall_all() {
     echo
     warn "This removes the tunnel, services, firewall rules and config of THIS tunnel only."
     ask_yn "Really uninstall?" n || return 0
-    systemctl stop "$BACKHAUL_SVC" "$FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
-    systemctl disable "$BACKHAUL_SVC" "$FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
-    for b in "$BACKHAUL_BIN" "$FRPS_BIN" "$FRPC_BIN"; do
+    systemctl stop "$BACKHAUL_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
+    systemctl disable "$BACKHAUL_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
+    for b in "$BACKHAUL_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"; do
         pkill -f -- "$b -c $CONFIG_DIR/" 2>/dev/null
     done
     [[ -x $CTL_SH ]] && "$CTL_SH" down
-    rm -f "$UNIT_DIR/$BACKHAUL_SVC" "$UNIT_DIR/$FRP_SVC" "$UNIT_DIR/$LINK_SVC"
+    rm -f "$UNIT_DIR/$BACKHAUL_SVC" "$UNIT_DIR/$LEGACY_FRP_SVC" "$UNIT_DIR/$LINK_SVC"
     systemctl daemon-reload
     ip link del gretun1 2>/dev/null
     ip link del gretap1 2>/dev/null
     rm -rf "$CONFIG_DIR"
-    rm -f "$BACKHAUL_BIN" "$FRPS_BIN" "$FRPC_BIN"
+    rm -f "$BACKHAUL_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"
     ok "Tunnel, services and firewall rules removed (the shared $LEGACY_BIN, if any, was not touched)."
 }
 
@@ -1476,9 +1347,9 @@ main_menu() {
     while true; do
         clear
         echo -e "${CYAN}========================================================${NC}"
-        echo -e "${GREEN}   GRE/GRETAP + Backhaul/FRP Reverse Tunnel Manager v$VERSION  ${NC}"
+        echo -e "${GREEN}   GRE/GRETAP + Backhaul Reverse Tunnel Manager v$VERSION  ${NC}"
         if load_conf 2>/dev/null; then
-            echo -e "${CYAN}   Active: $ROLE | $LINK_LABEL | $CORE_NAME/$PROTO | $SELF_IP${NC}"
+            echo -e "${CYAN}   Active: $ROLE | $LINK_LABEL | $PROTO/$PROFILE | $SELF_IP${NC}"
         else
             echo -e "${CYAN}   Not configured yet${NC}"
         fi
@@ -1487,7 +1358,7 @@ main_menu() {
         echo -e " 2) Configure ${YELLOW}KHAREJ Client${NC} (link + core client)"
         echo -e " 3) Status & logs"
         echo -e " 4) Diagnose connection  ${CYAN}(use this when something fails)${NC}"
-        echo -e " 5) Update forwarded ports (Iran; FRP: both servers)"
+        echo -e " 5) Update forwarded ports (Iran server only)"
         echo -e " 6) Restart tunnel services"
         echo -e " 7) Check / reinstall core binary (version + sha256)"
         echo -e " 8) Follow live core log (Ctrl+C to stop)"
