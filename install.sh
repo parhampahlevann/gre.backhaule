@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# GRE / GRETAP + Backhaul  Reverse Tunnel Manager  v5.0
+# GRE / GRETAP + Backhaul  Reverse Tunnel Manager  v5.1
 #
 #   Iran  server : TUN_IR_IP   <== GRE or GRETAP (MTU/MSS fixed, both sides) ==>   Kharej client : TUN_KH_IP
 #
@@ -36,6 +36,17 @@
 #   8. Forwarded ports are handled on the Iran server ONLY (iptables DNAT to
 #      the tunnel IP + INPUT accept, tagged BHGT) - Kharej is never asked.
 #
+# New in v5.1
+#   * Underlay IP version is now asked at setup (same choice on both servers):
+#       IPv4 -> gre/gretap  (unchanged)
+#       IPv6 -> ip6gre/ip6gretap, firewall accept rule moves to ip6tables
+#     This only affects LOCAL_IP/REMOTE_IP (the two servers' own public IPs
+#     used to build the GRE/GRETAP link). The private inner tunnel addresses
+#     (TUN_IR_IP/TUN_KH_IP, still picked from the usual IP-pair menu) and the
+#     forwarded-port DNAT rules stay IPv4 either way - a GRE/GRETAP tunnel
+#     carries whatever inner payload it's given regardless of which IP family
+#     encapsulates it, so nothing else needed to change.
+#
 # Things verified against the real binary (Backhaul, Musixal/Backhaul docs)
 #   * "ports" is configured on the [server] (Iran) side only; the client
 #     never needs a port list - that was purely an FRP requirement.
@@ -49,7 +60,7 @@
 # automatically the next time Setup (menu 1/2) or Uninstall (menu 9) runs.
 # ==============================================================================
 
-VERSION="5.0"
+VERSION="5.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -171,6 +182,31 @@ valid_ipv4() {
     done
     return 0
 }
+# IPv6 validation: delegate to python3's ipaddress module when available (authoritative),
+# otherwise fall back to a loose structural check (hex groups, at most one "::").
+valid_ipv6() {
+    local ip=$1
+    [[ $ip == *:* ]] || return 1
+    [[ $ip =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import ipaddress,sys
+try:
+    ipaddress.IPv6Address(sys.argv[1])
+except Exception:
+    sys.exit(1)' "$ip" 2>/dev/null
+        return $?
+    fi
+    (( $(grep -o "::" <<< "$ip" | wc -l) <= 1 )) || return 1
+    local -a groups=()
+    local g
+    IFS=':' read -ra groups <<< "${ip//::/: :}"
+    (( ${#groups[@]} <= 8 )) || return 1
+    for g in "${groups[@]}"; do
+        [[ -z $g || $g == " " ]] && continue
+        [[ $g =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    return 0
+}
 valid_port()  { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 valid_token() { [[ $1 =~ ^[A-Za-z0-9._~@%+=-]{1,64}$ ]]; }
 MENU_MAX=1
@@ -178,8 +214,14 @@ valid_menu()  { [[ $1 =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 1 && 10#$1 <= MENU_MAX )
 
 strip_ansi() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g'; }
 
+# detect this host's own outbound address for the chosen underlay IP version
+# (IP_VER is set by choose_ipver / load_conf before this is called)
 detect_ip() {
-    ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1
+    if [[ ${IP_VER:-4} == 6 ]]; then
+        ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* src \([0-9A-Fa-f:]*\).*/\1/p' | head -n1
+    else
+        ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1
+    fi
 }
 
 # parse_ports "1080, 443, 8443=443" -> PORT_MAP=("1080=1080" "443=443" "8443=443")
@@ -258,10 +300,22 @@ pick_free_port() {
 # derived settings (single source of truth = tunnel.conf)
 # ------------------------------------------------------------------------------
 set_link_vars() {
+    IP_VER=${IP_VER:-4}
     case ${LINK_TYPE:-gretap} in
-        gre)    LINK_TYPE=gre;    IFACE="gretun1"; LINK_LABEL="GRE (layer 3)" ;;
-        *)      LINK_TYPE=gretap; IFACE="gretap1"; LINK_LABEL="GRETAP (layer 2)" ;;
+        gre)    LINK_TYPE=gre;    IFACE="gretun1" ;;
+        *)      LINK_TYPE=gretap; IFACE="gretap1" ;;
     esac
+    if [[ $IP_VER == 6 ]]; then
+        case $LINK_TYPE in
+            gre) LINK_LABEL="GRE over IPv6 (layer 3)" ;;
+            *)   LINK_LABEL="GRETAP over IPv6 (layer 2)" ;;
+        esac
+    else
+        case $LINK_TYPE in
+            gre) LINK_LABEL="GRE (layer 3)" ;;
+            *)   LINK_LABEL="GRETAP (layer 2)" ;;
+        esac
+    fi
 }
 
 set_core_vars() {
@@ -337,6 +391,7 @@ save_conf() {
         printf 'ROLE=%q\n'       "$ROLE"
         printf 'CORE=%q\n'       "$CORE"
         printf 'PROFILE=%q\n'    "${PROFILE:-balance}"
+        printf 'IP_VER=%q\n'     "${IP_VER:-4}"
         printf 'LINK_TYPE=%q\n'  "$LINK_TYPE"
         printf 'IFACE=%q\n'      "$IFACE"
         printf 'LOCAL_IP=%q\n'   "$LOCAL_IP"
@@ -376,6 +431,7 @@ load_conf() {
     TUN_IR_IP=${TUN_IR_IP:-10.10.1.1}
     TUN_KH_IP=${TUN_KH_IP:-10.10.1.2}
     PROFILE=${PROFILE:-balance}
+    IP_VER=${IP_VER:-4}
     set_link_vars
     set_core_vars
     set_role_ips
@@ -466,17 +522,26 @@ write_ctl_script() {
 # shellcheck disable=SC1090
 source "$CONF_FILE" || { echo "cannot read $CONF_FILE" >&2; exit 1; }
 
-# defaults so a config written by v3.x still works
+# defaults so a config written by v3.x/v4.x still works
 LINK_TYPE=${LINK_TYPE:-gretap}
+IP_VER=${IP_VER:-4}
 PFX=${PFX:-30}
 FWD_TCP=${FWD_TCP:-1}
 FWD_UDP=${FWD_UDP:-${ACCEPT_UDP:-0}}
 CORE_BIN=${CORE_BIN:-${BACKHAUL_BIN:-}}
 
 TAG="BHGT"
-if iptables -w 5 -L -n >/dev/null 2>&1; then IPT=(iptables -w 5); else IPT=(iptables); fi
+# IPT4 handles every rule that matches on the DECAPSULATED inner traffic (which is
+# always IPv4 - the TUN_IR_IP/TUN_KH_IP private pair - no matter which underlay is
+# used). IPT6 is only used for the one rule that accepts the raw, still-encapsulated
+# GRE packet itself when the underlay (LOCAL_IP/REMOTE_IP) is IPv6.
+if iptables -w 5 -L -n >/dev/null 2>&1; then IPT4=(iptables -w 5); else IPT4=(iptables); fi
+IPT6=()
+if [[ $IP_VER == 6 ]]; then
+    if ip6tables -w 5 -L -n >/dev/null 2>&1; then IPT6=(ip6tables -w 5); else IPT6=(ip6tables); fi
+fi
 
-# ipt_ensure <table> <chain> <match/target args...>   (idempotent, inserted at top, tagged)
+# ipt_ensure <table> <chain> <match/target args...>   (idempotent, inserted at top, tagged, IPT4)
 ipt_ensure() {
     local t=$1 c=$2
     shift 2
@@ -487,7 +552,15 @@ ipt_ensure() {
         shift
     done
     spec=("${pre[@]}" -m comment --comment "$TAG" "${post[@]}")
-    "${IPT[@]}" -t "$t" -C "$c" "${spec[@]}" 2>/dev/null || "${IPT[@]}" -t "$t" -I "$c" 1 "${spec[@]}"
+    "${IPT4[@]}" -t "$t" -C "$c" "${spec[@]}" 2>/dev/null || "${IPT4[@]}" -t "$t" -I "$c" 1 "${spec[@]}"
+}
+
+# same, but always on IPT6 filter table - only used for the raw GRE-over-IPv6 accept rule
+ipt6_filter_ensure() {
+    local c=$1
+    shift
+    local -a spec=("$@" -m comment --comment "$TAG")
+    "${IPT6[@]}" -t filter -C "$c" "${spec[@]}" 2>/dev/null || "${IPT6[@]}" -t filter -I "$c" 1 "${spec[@]}"
 }
 
 # remove every rule carrying our tag, whatever the current config says
@@ -500,17 +573,33 @@ purge_rules() {
             line=${line//\"/}
             line="-D${line#-A}"
             read -ra words <<< "$line"
-            "${IPT[@]}" -t "$t" "${words[@]}" 2>/dev/null
-        done < <("${IPT[@]}" -t "$t" -S 2>/dev/null | grep -E -- "--comment \"?$TAG\"? ")
+            "${IPT4[@]}" -t "$t" "${words[@]}" 2>/dev/null
+        done < <("${IPT4[@]}" -t "$t" -S 2>/dev/null | grep -E -- "--comment \"?$TAG\"? ")
     done
+    if [[ $IP_VER == 6 ]]; then
+        while read -r line; do
+            [[ -n $line ]] || continue
+            line=${line//\"/}
+            line="-D${line#-A}"
+            read -ra words <<< "$line"
+            "${IPT6[@]}" -t filter "${words[@]}" 2>/dev/null
+        done < <("${IPT6[@]}" -t filter -S 2>/dev/null | grep -E -- "--comment \"?$TAG\"? ")
+    fi
     return 0
 }
 
 apply_rules() {
     local m pub
 
-    # --- filter: let GRE from the peer in, and everything that rides on the tunnel
-    ipt_ensure filter INPUT   -p gre -s "$REMOTE_IP" -j ACCEPT
+    # --- filter: let GRE from the peer in, and everything that rides on the tunnel.
+    # The raw GRE packet arrives as whatever the underlay is (REMOTE_IP's own family),
+    # so this one rule must run on the matching tool; everything else below is the
+    # DEcapsulated inner (always IPv4) traffic and always uses IPT4.
+    if [[ $IP_VER == 6 ]]; then
+        ipt6_filter_ensure INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+    else
+        ipt_ensure filter INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+    fi
     ipt_ensure filter INPUT   -i "$IFACE" -j ACCEPT
     ipt_ensure filter FORWARD -i "$IFACE" -j ACCEPT
     ipt_ensure filter FORWARD -o "$IFACE" -j ACCEPT
@@ -549,10 +638,17 @@ case "$1" in
     up)
         purge_rules
         modprobe ip_gre 2>/dev/null
+        [[ $IP_VER == 6 ]] && modprobe ip6_gre 2>/dev/null
         ip link del "$IFACE" 2>/dev/null
-        case $LINK_TYPE in gre) kind=gre ;; *) kind=gretap ;; esac
-        if ! ip link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255; then
-            echo "ERROR: cannot create $IFACE (type $kind). Possible causes: GRE support (ip_gre) is missing on this VPS/kernel," >&2
+        if [[ $IP_VER == 6 ]]; then
+            case $LINK_TYPE in gre) kind=ip6gre ;; *) kind=ip6gretap ;; esac
+            ttlkw=hoplimit
+        else
+            case $LINK_TYPE in gre) kind=gre ;; *) kind=gretap ;; esac
+            ttlkw=ttl
+        fi
+        if ! ip link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" $ttlkw 255; then
+            echo "ERROR: cannot create $IFACE (type $kind). Possible causes: GRE support (ip_gre/ip6_gre) is missing on this VPS/kernel," >&2
             echo "       LOCAL_IP $LOCAL_IP is not an address of this host, or another $kind tunnel with the same local/remote pair already exists (another script?)." >&2
             exit 1
         fi
@@ -814,6 +910,21 @@ fetch_core_binary() { # [force]
 # ------------------------------------------------------------------------------
 # interactive choices shared by setup / update
 # ------------------------------------------------------------------------------
+choose_ipver() {
+    local c
+    echo
+    info "Underlay IP version - the public IP each server uses to reach the other (must be the same on both servers):"
+    echo "   1) IPv4"
+    echo "   2) IPv6"
+    MENU_MAX=2
+    ask_valid c "Select underlay IP version" "1" valid_menu "Enter 1 or 2."
+    if (( 10#$c == 2 )); then IP_VER=6; else IP_VER=4; fi
+    if [[ $IP_VER == 6 ]] && ! command -v ip6tables >/dev/null 2>&1; then
+        err "ip6tables was not found (it normally ships together with iptables) - install it and run Setup again."
+        return 1
+    fi
+}
+
 choose_link() {
     local c
     echo
@@ -923,6 +1034,7 @@ setup_tunnel() { # iran | kharej
 
     ensure_deps || return 1
 
+    choose_ipver || return 1
     choose_link
     choose_ipset
     set_link_vars
@@ -931,10 +1043,13 @@ setup_tunnel() { # iran | kharej
     choose_proto
     choose_profile
 
+    local ip_validator="valid_ipv4"
+    [[ $IP_VER == 6 ]] && ip_validator="valid_ipv6"
+
     echo
     def_ip=$(detect_ip)
-    ask_valid LOCAL_IP "Enter $lbl_local public IP" "$def_ip" valid_ipv4 "Not a valid IPv4 address."
-    ask_valid REMOTE_IP "Enter $lbl_remote public IP" "" valid_ipv4 "Not a valid IPv4 address."
+    ask_valid LOCAL_IP "Enter $lbl_local public IP" "$def_ip" "$ip_validator" "Not a valid IPv$IP_VER address."
+    ask_valid REMOTE_IP "Enter $lbl_remote public IP" "" "$ip_validator" "Not a valid IPv$IP_VER address."
     if [[ $LOCAL_IP == "$REMOTE_IP" ]]; then
         err "Local and remote IP are identical."
         return 1
@@ -1002,7 +1117,7 @@ setup_tunnel() { # iran | kharej
 
     echo
     echo -e "${CYAN}Enter the SAME values on the other server:${NC}"
-    echo "  link type: $LINK_TYPE | IP pair: $TUN_IR_IP / $TUN_KH_IP | protocol: $PROTO | profile: $PROFILE | control port: $CTRL_PORT | token: $TOKEN"
+    echo "  underlay: IPv$IP_VER | link type: $LINK_TYPE | IP pair: $TUN_IR_IP / $TUN_KH_IP | protocol: $PROTO | profile: $PROFILE | control port: $CTRL_PORT | token: $TOKEN"
     info "The forwarded port list is only ever entered on the IRAN server - Kharej does not need it."
     if [[ $ROLE == kharej ]]; then
         echo
