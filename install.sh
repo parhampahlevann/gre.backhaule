@@ -1,26 +1,21 @@
 #!/bin/bash
 # ==============================================================================
-# GRE / GRETAP + Backhaul  Reverse Tunnel Manager  v5.1
+# GRE / GRETAP / Direct + Backhaul/FRP  Reverse Tunnel Manager  v6.0
 #
-#   Iran  server : TUN_IR_IP   <== GRE or GRETAP (MTU/MSS fixed, both sides) ==>   Kharej client : TUN_KH_IP
+#   Iran  server : TUN_IR_IP   <== GRE, GRETAP or Direct (MTU/MSS fixed in GRE/GRETAP) ==>   Kharej client : TUN_KH_IP
 #
 # Data path
-#   user -> Iran public IP:PORT --(iptables DNAT)--> TUN_IR_IP:PORT (Backhaul server)
-#        -> Backhaul control + data channels travel INSIDE the GRE/GRETAP link
-#        -> Backhaul client on Kharej -> 127.0.0.1:TARGET_PORT on the Kharej box
+#   user -> Iran public IP:PORT --(iptables DNAT, or none in Direct mode)--> TUN_IR_IP:PORT (core server)
+#        -> core control + data channels travel INSIDE the GRE/GRETAP link, or straight
+#           over the public IP when Direct mode is used
+#        -> core client on Kharej -> 127.0.0.1:TARGET_PORT on the Kharej box
 #
-# New in v5.0 (everything useful from v4.0 is kept)
-#   1. FRP core removed. Reason: FRP forces the SAME port list to be typed on
-#      BOTH servers (Iran AND Kharej), and any mismatch between the two breaks
-#      the tunnel. Backhaul only ever needed the port list on the Iran server
-#      (confirmed against Backhaul's own docs - "ports" is a server-only key,
-#      the client never declares ports), so this version is Backhaul-only:
-#      one source of truth (Iran), nothing to mistype on Kharej, fewer moving
-#      parts to break the server<->client connection.
+# New in v5.0
+#   1. FRP core removed (brought back in v6.0, see below). This version was Backhaul-only.
 #   2. Connection profile is chosen at setup, same on both sides:
-#        gaming / fast / balance / turbo - tunes Backhaul's own keepalive,
+#        gaming / fast / balance / turbo - tunes the core's own keepalive,
 #        heartbeat, channel/mux buffer sizes, pool size and reconnect timers.
-#   3. MTU/MSS are now a single fixed pair (not tied to profile or protocol),
+#   3. MTU/MSS are a single fixed pair (not tied to profile or protocol),
 #      so they are always identical on Iran and Kharej no matter which
 #      profile each admin happens to pick.
 #   4. Setup no longer blocks for up to 15-25 seconds waiting for the tunnel
@@ -31,10 +26,10 @@
 #   6. Local tunnel IP pair is chosen at setup:
 #        1) 10.0.0.1 (Iran)     <-> 10.0.0.2 (Kharej)      /30
 #        2) 203.0.113.10 (Iran) <-> 203.0.113.20 (Kharej)  /27
-#      The Backhaul server<->client connection AND all tunneled traffic use it.
-#   7. Protocol is chosen manually: tcp tcpmux udp ws wsmux wss wssmux.
-#   8. Forwarded ports are handled on the Iran server ONLY (iptables DNAT to
-#      the tunnel IP + INPUT accept, tagged BHGT) - Kharej is never asked.
+#   7. Protocol is chosen manually, per core (see below).
+#   8. Forwarded ports are handled on the Iran server for Backhaul (iptables
+#      DNAT to the tunnel IP + INPUT accept, tagged BHGT) - Kharej is never
+#      asked. FRP works differently, see "New in v6.0" below.
 #
 # New in v5.1
 #   * Underlay IP version is now asked at setup (same choice on both servers):
@@ -42,25 +37,54 @@
 #       IPv6 -> ip6gre/ip6gretap, firewall accept rule moves to ip6tables
 #     This only affects LOCAL_IP/REMOTE_IP (the two servers' own public IPs
 #     used to build the GRE/GRETAP link). The private inner tunnel addresses
-#     (TUN_IR_IP/TUN_KH_IP, still picked from the usual IP-pair menu) and the
-#     forwarded-port DNAT rules stay IPv4 either way - a GRE/GRETAP tunnel
-#     carries whatever inner payload it's given regardless of which IP family
-#     encapsulates it, so nothing else needed to change.
+#     (TUN_IR_IP/TUN_KH_IP, still picked from the usual IP-pair menu unless
+#     Direct mode is used) and the forwarded-port DNAT rules stay IPv4 either
+#     way - a GRE/GRETAP tunnel carries whatever inner payload it's given
+#     regardless of which IP family encapsulates it, so nothing else changed.
 #
-# Things verified against the real binary (Backhaul, Musixal/Backhaul docs)
-#   * "ports" is configured on the [server] (Iran) side only; the client
-#     never needs a port list - that was purely an FRP requirement.
+# New in v6.0
+#   1. Link type has a 3rd choice: Direct. No GRE/GRETAP interface is created
+#      and no local tunnel IP pair is asked - the core binds/connects straight
+#      on the chosen underlay public IP (LOCAL_IP/REMOTE_IP). Works with IPv4
+#      or IPv6, but it is most useful with IPv6: the core talks directly over
+#      the public IPv6 address instead of riding inside an extra GRE header.
+#      MTU/MSS clamping and the GRE accept rule are skipped in this mode;
+#      the control port and forwarded ports just get a plain firewall accept
+#      (DNAT is unnecessary because the core already binds the real public IP).
+#   2. A second core is available: FRP v0.61.1, picked at setup with the exact
+#      same workflow as Backhaul (same link-type/IP-pair/profile/token/port
+#      steps). Its own protocol set: tcp, kcp, quic, websocket, wss.
+#      IMPORTANT difference from Backhaul: Backhaul's "ports" list is a
+#      server-only (Iran) setting, but FRP's client (frpc) is what declares
+#      each forwarded port ([[proxies]]), not the server. So when FRP is
+#      selected, the SAME port list must be entered on BOTH servers: on Iran
+#      it becomes the server's allow-list (allowPorts), and on Kharej it
+#      becomes the actual proxy definitions. This is a protocol requirement
+#      of FRP itself, not a UX inconsistency - Setup prints a clear note
+#      about it on the Kharej side so it isn't mistaken for a bug.
+#
+# Things verified against the real binaries (Backhaul/Musixal docs, frp docs)
+#   * Backhaul: "ports" is configured on the [server] (Iran) side only; the
+#     client never needs a port list - that was purely an FRP(v4.0-ini) quirk.
 #   * Backhaul "udp" transport forwards UDP ports ONLY (no TCP listener).
-#   * Backhaul accept_udp (UDP-over-TCP) works with "tcp" but NOT with "tcpmux".
-#   * Backhaul logs are colored: ANSI codes are stripped before matching.
+#   * Backhaul accept_udp (UDP-over-TCP) works with "tcp" but NOT "tcpmux".
+#   * FRP: frps' proxyBindAddr defaults to its bindAddr, so binding frps to
+#     the private tunnel IP (same trick used for Backhaul) still requires a
+#     DNAT from the public NIC in GRE/GRETAP mode, exactly like Backhaul.
+#   * FRP: transport.tls.enable defaults to true since v0.50.0 - "wss" needs
+#     no manually generated certificate, unlike Backhaul's wss/wssmux.
+#   * Core logs are colored: ANSI codes are stripped before matching.
 #
-# Upgrade note: config dir and service names of v3.x/v4.x are kept on purpose,
-# so an older install is still shown by Status and replaced cleanly by Setup.
-# Leftover frps/frpc services and binaries from a v4.0 FRP setup are removed
-# automatically the next time Setup (menu 1/2) or Uninstall (menu 9) runs.
+# Upgrade note: config dir and service names of older versions are kept on
+# purpose, so an older install is still shown by Status and replaced cleanly
+# by Setup. Leftover frps/frpc services and binaries from a v4.0 (ini-based,
+# unversioned) FRP setup are removed automatically the next time Setup
+# (menu 1/2) or Uninstall (menu 9) runs - this is unrelated to the new,
+# supported FRP v0.61.1 core added in v6.0, which uses different binary
+# paths and is never touched by that legacy cleanup.
 # ==============================================================================
 
-VERSION="5.1"
+VERSION="6.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -76,28 +100,43 @@ TLS_KEY="$CONFIG_DIR/server.key"
 
 BACKHAUL_BIN="/usr/local/bin/backhaul-gretap"
 LEGACY_BIN="/usr/local/bin/backhaul"
-# legacy (v4.0 FRP) paths - only used to clean up a previous FRP install, never written again
+# legacy (v4.0 ini-based FRP) paths - only used to clean up a previous FRP
+# install, never written again. NOT the same paths as the new FRP core below.
 LEGACY_FRPS_BIN="/usr/local/bin/frps-gretap"
 LEGACY_FRPC_BIN="/usr/local/bin/frpc-gretap"
 LEGACY_FRP_SVC="frp-tunnel.service"
 
+# the new, supported FRP core (v6.0)
+FRP_VERSION="0.61.1"
+FRPS_BIN="/usr/local/bin/frps-core"
+FRPC_BIN="/usr/local/bin/frpc-core"
+
 UNIT_DIR="/etc/systemd/system"
 LINK_SVC="gretap-tunnel.service"
 BACKHAUL_SVC="backhaul-tunnel.service"
+FRP_SVC="frp-tunnel.service"
 
-# MTU/MSS are fixed and NEVER change with protocol or profile, so they are
-# always identical on Iran and Kharej no matter what else differs.
+# MTU/MSS are fixed and NEVER change with protocol, profile or core, so they
+# are always identical on Iran and Kharej no matter what else differs. They
+# only apply to GRE/GRETAP link types (Direct mode has no extra header).
 MSS_VAL="1240"
 MTU_VAL="1400"
 
-# local tunnel IP pairs (index 0 = option 1, index 1 = option 2)
+# local tunnel IP pairs (index 0 = option 1, index 1 = option 2) - unused in Direct mode
 IPSET_IR=("10.0.0.1"  "203.0.113.10")
 IPSET_KH=("10.0.0.2"  "203.0.113.20")
 IPSET_PFX=("30"       "27")
 
+# tunnel cores
+CORES=(backhaul frp)
+CORE_DESCS=(
+    "Backhaul - lean reverse tunnel, fewest moving parts (recommended)"
+    "FRP v$FRP_VERSION - fast reverse proxy, adds kcp/quic/websocket transports"
+)
+
 # Backhaul transports
-PROTOS=(tcp tcpmux udp ws wsmux wss wssmux)
-PROTO_DESCS=(
+BACKHAUL_PROTOS=(tcp tcpmux udp ws wsmux wss wssmux)
+BACKHAUL_PROTO_DESCS=(
     "plain TCP: lowest overhead, fastest in most cases (recommended)"
     "TCP + multiplexing: many small connections over few sockets"
     "UDP transport: forwards UDP ports only (games, VoIP, DNS, WireGuard...)"
@@ -107,13 +146,31 @@ PROTO_DESCS=(
     "WebSocket + TLS + multiplexing"
 )
 
-# connection profiles (must be the same on both servers)
+# FRP transports
+FRP_PROTOS=(tcp kcp quic websocket wss)
+FRP_PROTO_DESCS=(
+    "plain TCP: lowest overhead, fastest in most cases (recommended; TLS is already on by default)"
+    "KCP: UDP-based, often better on lossy/high-latency links, more CPU/bandwidth"
+    "QUIC: UDP-based, multiplexed, good on lossy/high-latency links"
+    "WebSocket: rides as HTTP(S)-looking traffic, useful behind strict filters"
+    "WebSocket + explicit TLS (wss)"
+)
+
+# connection profiles (must be the same on both servers, same menu for either core)
 PROFILES=(gaming fast balance turbo)
 PROFILE_DESCS=(
     "lowest ping/jitter: fast heartbeat, instant reconnect, small buffers"
     "very high speed, still low latency/jitter, light overhead (recommended)"
     "general purpose default - good all-round choice for everyday use"
     "max throughput for downloads/transfers: big buffers, more pooled connections"
+)
+
+# tunnel link types
+LINK_TYPES=(gre gretap direct)
+LINK_TYPE_DESCS=(
+    "GRE     - layer-3 point-to-point, lowest overhead"
+    "GRETAP  - layer-2 Ethernet over GRE (what older versions used)"
+    "Direct  - no GRE/GRETAP: the core connects straight over the public IP (best with IPv6, skips the tunnel IP pair)"
 )
 
 # ------------------------------------------------------------------------------
@@ -224,6 +281,21 @@ detect_ip() {
     fi
 }
 
+# bracket an address for a "host:port" string, only if it's IPv6 (contains ':').
+# Needed anywhere TUN_IR_IP/PEER_IP is concatenated with a port into one string
+# (Direct mode can make these IPv6; GRE/GRETAP mode never does).
+bracket_addr() { [[ $1 == *:* ]] && echo "[$1]" || echo "$1"; }
+
+# is the control-channel wire protocol UDP-based for the chosen core?
+# (Backhaul's "udp" transport, or FRP's "kcp"/"quic" transports)
+ctrl_proto_is_udp() {
+    if [[ $CORE == frp ]]; then
+        [[ $PROTO == kcp || $PROTO == quic ]]
+    else
+        [[ $PROTO == udp ]]
+    fi
+}
+
 # parse_ports "1080, 443, 8443=443" -> PORT_MAP=("1080=1080" "443=443" "8443=443")
 # entry "A" means public port A -> Kharej 127.0.0.1:A ; "A=B" means public A -> Kharej 127.0.0.1:B
 parse_ports() {
@@ -270,16 +342,16 @@ listener_conflicts() { # proto port
             *) continue ;;
         esac
         case $proc in
-            *'"backhaul-gretap"'*|*'"frps-gretap"'*|*'"frpc-gretap"'*) continue ;;
+            *'"backhaul-gretap"'*|*'"frps-gretap"'*|*'"frpc-gretap"'*|*'"frps-core"'*|*'"frpc-core"'*) continue ;;
         esac
         echo "$laddr ${proc:-unknown-process}"
     done
 }
 
-# conflicts on the control port, depending on protocol
+# conflicts on the control port, depending on the chosen core/protocol
 ctrl_conflicts() {
     {
-        if [[ $PROTO == udp ]]; then
+        if ctrl_proto_is_udp; then
             listener_conflicts udp "$CTRL_PORT" | sed 's/^/udp: /'
         else
             listener_conflicts tcp "$CTRL_PORT" | sed 's/^/tcp: /'
@@ -303,9 +375,12 @@ set_link_vars() {
     IP_VER=${IP_VER:-4}
     case ${LINK_TYPE:-gretap} in
         gre)    LINK_TYPE=gre;    IFACE="gretun1" ;;
+        direct) LINK_TYPE=direct; IFACE="" ;;
         *)      LINK_TYPE=gretap; IFACE="gretap1" ;;
     esac
-    if [[ $IP_VER == 6 ]]; then
+    if [[ $LINK_TYPE == direct ]]; then
+        LINK_LABEL="Direct (no GRE/GRETAP, native IPv$IP_VER)"
+    elif [[ $IP_VER == 6 ]]; then
         case $LINK_TYPE in
             gre) LINK_LABEL="GRE over IPv6 (layer 3)" ;;
             *)   LINK_LABEL="GRETAP over IPv6 (layer 2)" ;;
@@ -319,15 +394,30 @@ set_link_vars() {
 }
 
 set_core_vars() {
-    CORE=backhaul
-    CORE_NAME="Backhaul"
-    CORE_SVC=$BACKHAUL_SVC
-    LOG_OK_RE='channel established'
-    LOG_ERR_RE='\[(ERROR|WARNING)\]'
-    CORE_BIN=$BACKHAUL_BIN
-    CORE_TAR_NAME="backhaul"
-    CORE_CONF="$CONFIG_DIR/config.toml"
-    CORE_PROC="backhaul-gretap"
+    case ${CORE:-backhaul} in
+        frp)
+            CORE=frp
+            CORE_NAME="FRP"
+            CORE_SVC=$FRP_SVC
+            LOG_OK_RE='login to server success|start proxy success'
+            LOG_ERR_RE='\[(W|E)\]'
+            CORE_TAR_NAME=$([[ $ROLE == iran ]] && echo "frps" || echo "frpc")
+            CORE_BIN=$([[ $ROLE == iran ]] && echo "$FRPS_BIN" || echo "$FRPC_BIN")
+            CORE_PROC=$(basename "$CORE_BIN")
+            CORE_CONF="$CONFIG_DIR/frp.toml"
+            ;;
+        *)
+            CORE=backhaul
+            CORE_NAME="Backhaul"
+            CORE_SVC=$BACKHAUL_SVC
+            LOG_OK_RE='channel established'
+            LOG_ERR_RE='\[(ERROR|WARNING)\]'
+            CORE_BIN=$BACKHAUL_BIN
+            CORE_TAR_NAME="backhaul"
+            CORE_CONF="$CONFIG_DIR/config.toml"
+            CORE_PROC="backhaul-gretap"
+            ;;
+    esac
 }
 
 set_role_ips() {
@@ -341,18 +431,21 @@ set_role_ips() {
 }
 
 # which transport protocols of the forwarded ports are used (firewall)
+# TCP is always on; UDP is only added when ACCEPT_UDP was confirmed, EXCEPT
+# Backhaul's "udp" transport, which forwards UDP ports only (no TCP at all).
 set_fwd_flags() {
     FWD_TCP=1
-    FWD_UDP=0
-    case "$PROTO" in
-        udp) FWD_TCP=0; FWD_UDP=1 ;;
-        tcp) FWD_UDP=${ACCEPT_UDP:-0} ;;
-    esac
+    FWD_UDP=${ACCEPT_UDP:-0}
+    if [[ $CORE != frp && $PROTO == udp ]]; then
+        FWD_TCP=0
+        FWD_UDP=1
+    fi
 }
 
-# connection profile -> Backhaul tuning knobs. MTU/MSS are NOT part of this on
-# purpose (see MSS_VAL/MTU_VAL above) so they stay fixed no matter which
-# profile is picked on either side.
+# connection profile -> tuning knobs for whichever core is active. MTU/MSS are
+# NOT part of this on purpose (see MSS_VAL/MTU_VAL above) so they stay fixed
+# no matter which profile is picked on either side, and only ever apply to
+# GRE/GRETAP link types.
 set_profile_vars() {
     case ${PROFILE:-balance} in
         gaming)
@@ -360,24 +453,28 @@ set_profile_vars() {
             KEEPALIVE=20; HEARTBEAT=15; CHANNEL_SIZE=1024
             MUX_CON=4;  MUX_FRAMESIZE=16384; MUX_RECVBUF=2097152; MUX_STREAMBUF=32768
             POOL_COUNT=4;  AGGRESSIVE_POOL=false; DIAL_TIMEOUT=5;  RETRY_INTERVAL=1
+            FRP_HB_INTERVAL=5;  FRP_HB_TIMEOUT=15; FRP_POOL_COUNT=4;  FRP_TCP_MUX=false
             ;;
         fast)
             PROFILE=fast;     PROFILE_LABEL="Fast (max speed, low latency)"
             KEEPALIVE=40; HEARTBEAT=25; CHANNEL_SIZE=2048
             MUX_CON=8;  MUX_FRAMESIZE=32768; MUX_RECVBUF=4194304; MUX_STREAMBUF=65536
             POOL_COUNT=8;  AGGRESSIVE_POOL=false; DIAL_TIMEOUT=8;  RETRY_INTERVAL=2
+            FRP_HB_INTERVAL=10; FRP_HB_TIMEOUT=30; FRP_POOL_COUNT=8;  FRP_TCP_MUX=true
             ;;
         turbo)
             PROFILE=turbo;    PROFILE_LABEL="Turbo (max throughput)"
             KEEPALIVE=90; HEARTBEAT=60; CHANNEL_SIZE=8192
             MUX_CON=16; MUX_FRAMESIZE=65536; MUX_RECVBUF=8388608; MUX_STREAMBUF=131072
             POOL_COUNT=16; AGGRESSIVE_POOL=true;  DIAL_TIMEOUT=15; RETRY_INTERVAL=5
+            FRP_HB_INTERVAL=30; FRP_HB_TIMEOUT=90; FRP_POOL_COUNT=16; FRP_TCP_MUX=true
             ;;
         *)
             PROFILE=balance;  PROFILE_LABEL="Balance (general purpose)"
             KEEPALIVE=75; HEARTBEAT=40; CHANNEL_SIZE=2048
             MUX_CON=8;  MUX_FRAMESIZE=32768; MUX_RECVBUF=4194304; MUX_STREAMBUF=65536
             POOL_COUNT=8;  AGGRESSIVE_POOL=false; DIAL_TIMEOUT=10; RETRY_INTERVAL=3
+            FRP_HB_INTERVAL=30; FRP_HB_TIMEOUT=90; FRP_POOL_COUNT=8;  FRP_TCP_MUX=false
             ;;
     esac
 }
@@ -398,7 +495,7 @@ save_conf() {
         printf 'REMOTE_IP=%q\n'  "$REMOTE_IP"
         printf 'TUN_IR_IP=%q\n'  "$TUN_IR_IP"
         printf 'TUN_KH_IP=%q\n'  "$TUN_KH_IP"
-        printf 'PFX=%q\n'        "$PFX"
+        printf 'PFX=%q\n'        "${PFX:-}"
         printf 'SELF_IP=%q\n'    "$SELF_IP"
         printf 'PEER_IP=%q\n'    "$PEER_IP"
         printf 'CTRL_PORT=%q\n'  "$CTRL_PORT"
@@ -414,6 +511,10 @@ save_conf() {
         printf 'CORE_CONF=%q\n'  "$CORE_CONF"
         printf 'TLS_CERT=%q\n'   "$TLS_CERT"
         printf 'TLS_KEY=%q\n'    "$TLS_KEY"
+        printf 'FRP_HB_INTERVAL=%q\n' "${FRP_HB_INTERVAL:-30}"
+        printf 'FRP_HB_TIMEOUT=%q\n'  "${FRP_HB_TIMEOUT:-90}"
+        printf 'FRP_POOL_COUNT=%q\n'  "${FRP_POOL_COUNT:-8}"
+        printf 'FRP_TCP_MUX=%q\n'     "${FRP_TCP_MUX:-false}"
     } > "$CONF_FILE"
 }
 
@@ -422,7 +523,7 @@ load_conf() {
     # shellcheck disable=SC1090
     source "$CONF_FILE" || return 1
     [[ -n ${ROLE:-} ]] || return 1
-    # defaults / names used by v3.x/v4.x so an old install is still understood
+    # defaults / names used by older versions so an old install is still understood
     LINK_TYPE=${LINK_TYPE:-gretap}
     CTRL_PORT=${CTRL_PORT:-${BH_PORT:-}}
     TOKEN=${TOKEN:-${BH_TOKEN:-}}
@@ -432,6 +533,7 @@ load_conf() {
     TUN_KH_IP=${TUN_KH_IP:-10.10.1.2}
     PROFILE=${PROFILE:-balance}
     IP_VER=${IP_VER:-4}
+    CORE=${CORE:-backhaul}
     set_link_vars
     set_core_vars
     set_role_ips
@@ -503,9 +605,73 @@ write_backhaul_conf() {
     } > "$CORE_CONF"
 }
 
+# FRP TOML config. frps' proxyBindAddr defaults to its bindAddr, so binding
+# bindAddr to TUN_IR_IP (the private tunnel IP, or the real public IP in
+# Direct mode) makes the forwarded-port listeners land on the same address
+# as the control port - exactly like Backhaul's bind_addr trick, so the same
+# DNAT firewall rules in gretap-ctl.sh work unmodified for either core.
+write_frp_conf() {
+    local m pub tgt
+    {
+        if [[ $ROLE == iran ]]; then
+            echo "bindAddr = \"$TUN_IR_IP\""
+            echo "bindPort = $CTRL_PORT"
+            [[ $PROTO == kcp  ]] && echo "kcpBindPort = $CTRL_PORT"
+            [[ $PROTO == quic ]] && echo "quicBindPort = $CTRL_PORT"
+            echo "auth.method = \"token\""
+            echo "auth.token = \"$TOKEN\""
+            echo "log.level = \"info\""
+            if [[ -n ${PORTS:-} ]]; then
+                echo "allowPorts = ["
+                for m in $PORTS; do
+                    pub=${m%%=*}
+                    echo "  { single = $pub },"
+                done
+                echo "]"
+            fi
+        else
+            echo "serverAddr = \"$TUN_IR_IP\""
+            echo "serverPort = $CTRL_PORT"
+            echo "transport.protocol = \"$PROTO\""
+            echo "transport.heartbeatInterval = ${FRP_HB_INTERVAL:-30}"
+            echo "transport.heartbeatTimeout = ${FRP_HB_TIMEOUT:-90}"
+            echo "transport.poolCount = ${FRP_POOL_COUNT:-8}"
+            echo "transport.tcpMux = ${FRP_TCP_MUX:-false}"
+            echo "auth.method = \"token\""
+            echo "auth.token = \"$TOKEN\""
+            echo "log.level = \"info\""
+            for m in $PORTS; do
+                pub=${m%%=*}
+                tgt=${m#*=}
+                if [[ ${FWD_TCP:-1} == 1 ]]; then
+                    echo
+                    echo "[[proxies]]"
+                    echo "name = \"p${pub}_tcp\""
+                    echo "type = \"tcp\""
+                    echo "localIP = \"127.0.0.1\""
+                    echo "localPort = $tgt"
+                    echo "remotePort = $pub"
+                fi
+                if [[ ${FWD_UDP:-0} == 1 ]]; then
+                    echo
+                    echo "[[proxies]]"
+                    echo "name = \"p${pub}_udp\""
+                    echo "type = \"udp\""
+                    echo "localIP = \"127.0.0.1\""
+                    echo "localPort = $tgt"
+                    echo "remotePort = $pub"
+                fi
+            done
+        fi
+    } > "$CORE_CONF"
+}
+
 write_core_conf() {
     install -m 600 /dev/null "$CORE_CONF"
-    write_backhaul_conf
+    case $CORE in
+        frp) write_frp_conf ;;
+        *)   write_backhaul_conf ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------
@@ -522,24 +688,35 @@ write_ctl_script() {
 # shellcheck disable=SC1090
 source "$CONF_FILE" || { echo "cannot read $CONF_FILE" >&2; exit 1; }
 
-# defaults so a config written by v3.x/v4.x still works
+# defaults so a config written by an older version still works
 LINK_TYPE=${LINK_TYPE:-gretap}
 IP_VER=${IP_VER:-4}
 PFX=${PFX:-30}
 FWD_TCP=${FWD_TCP:-1}
 FWD_UDP=${FWD_UDP:-${ACCEPT_UDP:-0}}
+CORE=${CORE:-backhaul}
 CORE_BIN=${CORE_BIN:-${BACKHAUL_BIN:-}}
 
 TAG="BHGT"
 # IPT4 handles every rule that matches on the DECAPSULATED inner traffic (which is
-# always IPv4 - the TUN_IR_IP/TUN_KH_IP private pair - no matter which underlay is
-# used). IPT6 is only used for the one rule that accepts the raw, still-encapsulated
-# GRE packet itself when the underlay (LOCAL_IP/REMOTE_IP) is IPv6.
+# always IPv4 - the TUN_IR_IP/TUN_KH_IP private pair, or the real public IPv4/IPv6
+# address in Direct mode - no matter which underlay is used). IPT6 is only used
+# for the one rule that accepts the raw, still-encapsulated GRE packet itself when
+# the underlay (LOCAL_IP/REMOTE_IP) is IPv6 (never applies in Direct mode).
 if iptables -w 5 -L -n >/dev/null 2>&1; then IPT4=(iptables -w 5); else IPT4=(iptables); fi
 IPT6=()
 if [[ $IP_VER == 6 ]]; then
     if ip6tables -w 5 -L -n >/dev/null 2>&1; then IPT6=(ip6tables -w 5); else IPT6=(ip6tables); fi
 fi
+
+# is the control-channel wire protocol UDP-based for the chosen core?
+ctrl_is_udp() {
+    if [[ $CORE == frp ]]; then
+        [[ $PROTO == kcp || $PROTO == quic ]]
+    else
+        [[ $PROTO == udp ]]
+    fi
+}
 
 # ipt_ensure <table> <chain> <match/target args...>   (idempotent, inserted at top, tagged, IPT4)
 ipt_ensure() {
@@ -591,43 +768,63 @@ purge_rules() {
 apply_rules() {
     local m pub
 
-    # --- filter: let GRE from the peer in, and everything that rides on the tunnel.
-    # The raw GRE packet arrives as whatever the underlay is (REMOTE_IP's own family),
-    # so this one rule must run on the matching tool; everything else below is the
-    # DEcapsulated inner (always IPv4) traffic and always uses IPT4.
-    if [[ $IP_VER == 6 ]]; then
-        ipt6_filter_ensure INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+    if [[ $LINK_TYPE == direct ]]; then
+        # no GRE/GRETAP interface: the core already binds TUN_IR_IP (the real
+        # public IP in this mode), so just open the control port directly.
+        if [[ $ROLE == iran ]]; then
+            if ctrl_is_udp; then
+                ipt_ensure filter INPUT -d "$TUN_IR_IP" -p udp --dport "$CTRL_PORT" -j ACCEPT
+            else
+                ipt_ensure filter INPUT -d "$TUN_IR_IP" -p tcp --dport "$CTRL_PORT" -j ACCEPT
+            fi
+        fi
     else
-        ipt_ensure filter INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
-    fi
-    ipt_ensure filter INPUT   -i "$IFACE" -j ACCEPT
-    ipt_ensure filter FORWARD -i "$IFACE" -j ACCEPT
-    ipt_ensure filter FORWARD -o "$IFACE" -j ACCEPT
+        # --- filter: let GRE from the peer in, and everything that rides on the tunnel.
+        # The raw GRE packet arrives as whatever the underlay is (REMOTE_IP's own family),
+        # so this one rule must run on the matching tool; everything else below is the
+        # DEcapsulated inner (always IPv4) traffic and always uses IPT4.
+        if [[ $IP_VER == 6 ]]; then
+            ipt6_filter_ensure INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+        else
+            ipt_ensure filter INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+        fi
+        ipt_ensure filter INPUT   -i "$IFACE" -j ACCEPT
+        ipt_ensure filter FORWARD -i "$IFACE" -j ACCEPT
+        ipt_ensure filter FORWARD -o "$IFACE" -j ACCEPT
 
-    # --- mangle: MSS clamp
-    ipt_ensure mangle FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
-    ipt_ensure mangle FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
-    ipt_ensure mangle OUTPUT  -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
-    ipt_ensure mangle INPUT   -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
+        # --- mangle: MSS clamp (only meaningful with the extra GRE/GRETAP header)
+        ipt_ensure mangle FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
+        ipt_ensure mangle FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
+        ipt_ensure mangle OUTPUT  -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
+        ipt_ensure mangle INPUT   -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VAL"
+    fi
 
     if [[ $ROLE == iran ]]; then
         for m in $PORTS; do
             pub=${m%%=*}
             # traffic that arrives on the PUBLIC NIC and is DNATed to the tunnel IP
-            # is delivered locally: it needs its own INPUT accept (NOT covered by -i $IFACE)
+            # is delivered locally: it needs its own INPUT accept (NOT covered by -i $IFACE).
+            # In Direct mode TUN_IR_IP already IS the public IP, so no DNAT is needed -
+            # the core's own listener already sits on that address.
             if [[ $FWD_TCP == 1 ]]; then
                 ipt_ensure filter INPUT -d "$TUN_IR_IP" -p tcp --dport "$pub" -j ACCEPT
-                ipt_ensure nat PREROUTING ! -i "$IFACE" -m addrtype --dst-type LOCAL -p tcp --dport "$pub" -j DNAT --to-destination "$TUN_IR_IP:$pub"
+                if [[ $LINK_TYPE != direct ]]; then
+                    ipt_ensure nat PREROUTING ! -i "$IFACE" -m addrtype --dst-type LOCAL -p tcp --dport "$pub" -j DNAT --to-destination "$TUN_IR_IP:$pub"
+                fi
             fi
             if [[ $FWD_UDP == 1 ]]; then
                 ipt_ensure filter INPUT -d "$TUN_IR_IP" -p udp --dport "$pub" -j ACCEPT
-                ipt_ensure nat PREROUTING ! -i "$IFACE" -m addrtype --dst-type LOCAL -p udp --dport "$pub" -j DNAT --to-destination "$TUN_IR_IP:$pub"
+                if [[ $LINK_TYPE != direct ]]; then
+                    ipt_ensure nat PREROUTING ! -i "$IFACE" -m addrtype --dst-type LOCAL -p udp --dport "$pub" -j DNAT --to-destination "$TUN_IR_IP:$pub"
+                fi
             fi
         done
         # tunnel traffic must never be touched by any other DNAT/REDIRECT rule on the box.
-        # Inserted last on purpose so it ends up FIRST in the chain.
-        ipt_ensure nat PREROUTING -i "$IFACE" -j ACCEPT
-    else
+        # Inserted last on purpose so it ends up FIRST in the chain. N/A in Direct mode.
+        if [[ $LINK_TYPE != direct ]]; then
+            ipt_ensure nat PREROUTING -i "$IFACE" -j ACCEPT
+        fi
+    elif [[ $LINK_TYPE != direct ]]; then
         ipt_ensure nat OUTPUT -o "$IFACE" -j ACCEPT
     fi
 }
@@ -637,24 +834,26 @@ has_self_ip() { ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet $SELF_I
 case "$1" in
     up)
         purge_rules
-        modprobe ip_gre 2>/dev/null
-        [[ $IP_VER == 6 ]] && modprobe ip6_gre 2>/dev/null
-        ip link del "$IFACE" 2>/dev/null
-        if [[ $IP_VER == 6 ]]; then
-            case $LINK_TYPE in gre) kind=ip6gre ;; *) kind=ip6gretap ;; esac
-            ttlkw=hoplimit
-        else
-            case $LINK_TYPE in gre) kind=gre ;; *) kind=gretap ;; esac
-            ttlkw=ttl
+        if [[ $LINK_TYPE != direct ]]; then
+            modprobe ip_gre 2>/dev/null
+            [[ $IP_VER == 6 ]] && modprobe ip6_gre 2>/dev/null
+            ip link del "$IFACE" 2>/dev/null
+            if [[ $IP_VER == 6 ]]; then
+                case $LINK_TYPE in gre) kind=ip6gre ;; *) kind=ip6gretap ;; esac
+                ttlkw=hoplimit
+            else
+                case $LINK_TYPE in gre) kind=gre ;; *) kind=gretap ;; esac
+                ttlkw=ttl
+            fi
+            if ! ip link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" $ttlkw 255; then
+                echo "ERROR: cannot create $IFACE (type $kind). Possible causes: GRE support (ip_gre/ip6_gre) is missing on this VPS/kernel," >&2
+                echo "       LOCAL_IP $LOCAL_IP is not an address of this host, or another $kind tunnel with the same local/remote pair already exists (another script?)." >&2
+                exit 1
+            fi
+            ip addr add "$SELF_IP/$PFX" dev "$IFACE" || exit 1
+            ip link set "$IFACE" mtu "$MTU_VAL" up || exit 1
+            sysctl -qw "net.ipv4.conf.$IFACE.rp_filter=0" 2>/dev/null
         fi
-        if ! ip link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" $ttlkw 255; then
-            echo "ERROR: cannot create $IFACE (type $kind). Possible causes: GRE support (ip_gre/ip6_gre) is missing on this VPS/kernel," >&2
-            echo "       LOCAL_IP $LOCAL_IP is not an address of this host, or another $kind tunnel with the same local/remote pair already exists (another script?)." >&2
-            exit 1
-        fi
-        ip addr add "$SELF_IP/$PFX" dev "$IFACE" || exit 1
-        ip link set "$IFACE" mtu "$MTU_VAL" up || exit 1
-        sysctl -qw "net.ipv4.conf.$IFACE.rp_filter=0" 2>/dev/null
         apply_rules
         ;;
     reload)
@@ -663,7 +862,7 @@ case "$1" in
         ;;
     down)
         purge_rules
-        ip link del "$IFACE" 2>/dev/null
+        [[ -n $IFACE ]] && ip link del "$IFACE" 2>/dev/null
         exit 0
         ;;
     prestart)
@@ -675,10 +874,12 @@ case "$1" in
             echo "ERROR: $CORE_CONF is missing or empty (run Setup again)" >&2
             exit 1
         fi
-        for _ in $(seq 1 20); do has_self_ip && break; sleep 1; done
-        if ! has_self_ip; then
-            echo "ERROR: $IFACE has no $SELF_IP address" >&2
-            exit 1
+        if [[ $LINK_TYPE != direct ]]; then
+            for _ in $(seq 1 20); do has_self_ip && break; sleep 1; done
+            if ! has_self_ip; then
+                echo "ERROR: $IFACE has no $SELF_IP address" >&2
+                exit 1
+            fi
         fi
         if [[ $ROLE == kharej ]]; then
             for _ in $(seq 1 10); do ping -c1 -W1 "$PEER_IP" >/dev/null 2>&1 && break; sleep 1; done
@@ -696,7 +897,7 @@ CTL_EOF
 }
 
 write_units() {
-    local s
+    local s other_svc
     cat > "$UNIT_DIR/$LINK_SVC" <<EOF
 [Unit]
 Description=$LINK_LABEL tunnel and firewall rules (gre-tunnel-manager)
@@ -733,17 +934,23 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    # clean up a leftover FRP install from v4.0, if any (one core now: Backhaul)
+    # clean up a leftover v4.0 (ini-based) FRP install, if any
     systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
     rm -f "$UNIT_DIR/$LEGACY_FRP_SVC"
+
+    # only one core should auto-start: disable the OTHER core's unit, if it exists
+    if [[ $CORE_SVC == "$BACKHAUL_SVC" ]]; then other_svc=$FRP_SVC; else other_svc=$BACKHAUL_SVC; fi
+    systemctl stop "$other_svc" >/dev/null 2>&1
+    systemctl disable "$other_svc" >/dev/null 2>&1
+
     systemctl daemon-reload
     systemctl enable "$LINK_SVC" "$CORE_SVC" >/dev/null 2>&1
 }
 
 stop_services() {
     local b
-    systemctl stop "$BACKHAUL_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
-    for b in "$BACKHAUL_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"; do
+    systemctl stop "$BACKHAUL_SVC" "$FRP_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
+    for b in "$BACKHAUL_BIN" "$FRPS_BIN" "$FRPC_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"; do
         pkill -f -- "$b -c $CONFIG_DIR/" 2>/dev/null
     done
     return 0
@@ -861,7 +1068,10 @@ fetch_core_binary() { # [force]
         aarch64|arm64) arch="arm64" ;;
         *) err "Unsupported architecture: $(uname -m)"; return 1 ;;
     esac
-    url="https://github.com/Musixal/Backhaul/releases/latest/download/backhaul_linux_${arch}.tar.gz"
+    case $CORE in
+        frp) url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${arch}.tar.gz" ;;
+        *)   url="https://github.com/Musixal/Backhaul/releases/latest/download/backhaul_linux_${arch}.tar.gz" ;;
+    esac
 
     tmp=$(mktemp) || return 1
     info "Downloading $url"
@@ -874,7 +1084,7 @@ fetch_core_binary() { # [force]
     rm -f "$tmp"
     warn "GitHub download failed (blocked / offline?)."
 
-    if [[ -x $LEGACY_BIN ]] && is_elf "$LEGACY_BIN"; then
+    if [[ $CORE == backhaul ]] && [[ -x $LEGACY_BIN ]] && is_elf "$LEGACY_BIN"; then
         warn "Found an existing binary at $LEGACY_BIN (probably installed by another script)."
         if ask_yn "Copy and use it for this tunnel?" n; then
             if install_binary_file "$LEGACY_BIN"; then
@@ -925,15 +1135,28 @@ choose_ipver() {
     fi
 }
 
+choose_core() {
+    local i c
+    echo
+    info "Tunnel core (must be the same on both servers):"
+    for i in "${!CORES[@]}"; do
+        printf '   %d) %-9s %s\n' $((i + 1)) "${CORES[i]}" "${CORE_DESCS[i]}"
+    done
+    MENU_MAX=${#CORES[@]}
+    ask_valid c "Select core" "1" valid_menu "Enter a number from 1 to $MENU_MAX."
+    CORE=${CORES[$((10#$c - 1))]}
+}
+
 choose_link() {
-    local c
+    local i c
     echo
     info "Tunnel link type (must be the same on both servers):"
-    echo "   1) GRE     - layer-3 point-to-point, lowest overhead"
-    echo "   2) GRETAP  - layer-2 Ethernet over GRE (what v3.x used)"
-    MENU_MAX=2
-    ask_valid c "Select link type" "2" valid_menu "Enter 1 or 2."
-    if (( 10#$c == 1 )); then LINK_TYPE=gre; else LINK_TYPE=gretap; fi
+    for i in "${!LINK_TYPES[@]}"; do
+        printf '   %d) %-8s %s\n' $((i + 1)) "${LINK_TYPES[i]}" "${LINK_TYPE_DESCS[i]}"
+    done
+    MENU_MAX=${#LINK_TYPES[@]}
+    ask_valid c "Select link type" "2" valid_menu "Enter a number from 1 to $MENU_MAX."
+    LINK_TYPE=${LINK_TYPES[$((10#$c - 1))]}
 }
 
 choose_ipset() {
@@ -955,12 +1178,21 @@ choose_proto() {
     local i c
     echo
     info "$CORE_NAME protocol (must be the same on both servers):"
-    for i in "${!PROTOS[@]}"; do
-        printf '   %d) %-10s %s\n' $((i + 1)) "${PROTOS[i]}" "${PROTO_DESCS[i]}"
-    done
-    MENU_MAX=${#PROTOS[@]}
-    ask_valid c "Select protocol" "1" valid_menu "Enter a number from 1 to $MENU_MAX."
-    PROTO=${PROTOS[$((10#$c - 1))]}
+    if [[ $CORE == frp ]]; then
+        for i in "${!FRP_PROTOS[@]}"; do
+            printf '   %d) %-10s %s\n' $((i + 1)) "${FRP_PROTOS[i]}" "${FRP_PROTO_DESCS[i]}"
+        done
+        MENU_MAX=${#FRP_PROTOS[@]}
+        ask_valid c "Select protocol" "1" valid_menu "Enter a number from 1 to $MENU_MAX."
+        PROTO=${FRP_PROTOS[$((10#$c - 1))]}
+    else
+        for i in "${!BACKHAUL_PROTOS[@]}"; do
+            printf '   %d) %-10s %s\n' $((i + 1)) "${BACKHAUL_PROTOS[i]}" "${BACKHAUL_PROTO_DESCS[i]}"
+        done
+        MENU_MAX=${#BACKHAUL_PROTOS[@]}
+        ask_valid c "Select protocol" "1" valid_menu "Enter a number from 1 to $MENU_MAX."
+        PROTO=${BACKHAUL_PROTOS[$((10#$c - 1))]}
+    fi
 }
 
 choose_profile() {
@@ -976,7 +1208,7 @@ choose_profile() {
     set_profile_vars
 }
 
-prompt_ports() { # Iran server only - Kharej is never asked for a port list
+prompt_ports() { # entered on Iran for Backhaul; on BOTH sides for FRP (see header notes)
     local raw m pub conflicts msg
     while true; do
         msg="Ports to forward (e.g. 1080,443  -  use 8443=443 for public 8443 -> Kharej 443)"
@@ -1007,11 +1239,25 @@ prompt_ports() { # Iran server only - Kharej is never asked for a port list
 print_summary() {
     echo
     echo -e "${CYAN}--------------- configuration summary ($ROLE) ---------------${NC}"
-    echo "  Link      : $LINK_LABEL ($IFACE)   public IPs: this $LOCAL_IP <-> peer $REMOTE_IP"
-    echo "  Tunnel IPs: Iran $TUN_IR_IP <-> Kharej $TUN_KH_IP (/$PFX)   this server: $SELF_IP"
+    if [[ -n $IFACE ]]; then
+        echo "  Link      : $LINK_LABEL ($IFACE)   public IPs: this $LOCAL_IP <-> peer $REMOTE_IP"
+    else
+        echo "  Link      : $LINK_LABEL   public IPs: this $LOCAL_IP <-> peer $REMOTE_IP"
+    fi
+    if [[ $LINK_TYPE == direct ]]; then
+        echo "  Addressing: direct - the core binds/connects straight on the public IPs above"
+    else
+        echo "  Tunnel IPs: Iran $TUN_IR_IP <-> Kharej $TUN_KH_IP (/$PFX)   this server: $SELF_IP"
+    fi
     echo "  Core      : $CORE_NAME   protocol: $PROTO   profile: $PROFILE_LABEL"
-    echo "  MTU/MSS   : $MTU_VAL / $MSS_VAL (fixed, same regardless of profile)"
-    echo "  Control   : $TUN_IR_IP:$CTRL_PORT (inside the tunnel)"
+    if [[ $LINK_TYPE != direct ]]; then
+        echo "  MTU/MSS   : $MTU_VAL / $MSS_VAL (fixed, same regardless of profile)"
+    fi
+    if [[ $LINK_TYPE == direct ]]; then
+        echo "  Control   : $TUN_IR_IP:$CTRL_PORT"
+    else
+        echo "  Control   : $TUN_IR_IP:$CTRL_PORT (inside the tunnel)"
+    fi
     echo "  Token     : $TOKEN"
     if [[ -n ${PORTS:-} ]]; then
         echo "  Ports     : ${PORTS// /, }   (TCP: $([[ ${FWD_TCP:-1} == 1 ]] && echo yes || echo no), UDP: $([[ ${FWD_UDP:-0} == 1 ]] && echo yes || echo no))"
@@ -1035,10 +1281,17 @@ setup_tunnel() { # iran | kharej
     ensure_deps || return 1
 
     choose_ipver || return 1
+    choose_core
     choose_link
-    choose_ipset
     set_link_vars
     set_core_vars
+    if [[ $LINK_TYPE != direct ]]; then
+        choose_ipset
+    else
+        TUN_IR_IP=""
+        TUN_KH_IP=""
+        PFX=""
+    fi
     set_role_ips
     choose_proto
     choose_profile
@@ -1055,9 +1308,21 @@ setup_tunnel() { # iran | kharej
         return 1
     fi
 
+    if [[ $LINK_TYPE == direct ]]; then
+        if [[ $ROLE == iran ]]; then
+            TUN_IR_IP=$LOCAL_IP
+            TUN_KH_IP=$REMOTE_IP
+        else
+            TUN_IR_IP=$REMOTE_IP
+            TUN_KH_IP=$LOCAL_IP
+        fi
+        PFX=""
+        set_role_ips
+    fi
+
     def_port=3080
     while true; do
-        ask_valid CTRL_PORT "$CORE_NAME control port (reached INSIDE the tunnel)" "$def_port" valid_port "Port must be 1-65535."
+        ask_valid CTRL_PORT "$CORE_NAME control port (reached INSIDE the tunnel, or directly in Direct mode)" "$def_port" valid_port "Port must be 1-65535."
         [[ $ROLE == iran ]] || break
         c=$(ctrl_conflicts)
         [[ -z $c ]] && break
@@ -1068,17 +1333,25 @@ setup_tunnel() { # iran | kharej
     done
 
     ask_valid TOKEN "Tunnel secret token (must be identical on both sides)" "123456" valid_token "1-64 chars from: A-Z a-z 0-9 . _ ~ @ % + = -"
-    [[ $TOKEN == "123456" ]] && warn "Using the default token. The control port is only reachable inside the tunnel, but a custom token is better."
+    [[ $TOKEN == "123456" ]] && warn "Using the default token. The control port is only reachable inside the tunnel (or directly, in Direct mode), but a custom token is better."
 
     ACCEPT_UDP=0
     PORTS=""
-    if [[ $PROTO == tcp ]]; then
-        ask_yn "Also forward UDP on those ports (Backhaul UDP-over-TCP)? (same answer on both servers)" n && ACCEPT_UDP=1
-    elif [[ $PROTO == udp ]]; then
-        info "Backhaul 'udp' transport forwards UDP ports only (no TCP)."
+    if [[ $CORE == frp ]]; then
+        ask_yn "Also forward UDP on those ports, besides TCP? (same answer on both servers)" n && ACCEPT_UDP=1
+    else
+        if [[ $PROTO == tcp ]]; then
+            ask_yn "Also forward UDP on those ports (Backhaul UDP-over-TCP)? (same answer on both servers)" n && ACCEPT_UDP=1
+        elif [[ $PROTO == udp ]]; then
+            info "Backhaul 'udp' transport forwards UDP ports only (no TCP)."
+        fi
     fi
     set_fwd_flags
     if [[ $ROLE == iran ]]; then
+        prompt_ports
+        PORTS="${PORT_MAP[*]}"
+    elif [[ $CORE == frp ]]; then
+        warn "FRP needs the port list entered again here: unlike Backhaul, frpc (the Kharej client) - not the server - is what declares each forwarded port."
         prompt_ports
         PORTS="${PORT_MAP[*]}"
     fi
@@ -1086,19 +1359,19 @@ setup_tunnel() { # iran | kharej
     ask_yn "Apply this configuration now?" y || { warn "Aborted - nothing was changed."; return 1; }
 
     fetch_core_binary 0 || { err "Cannot continue without the $CORE_NAME binary."; return 1; }
-    if [[ $ROLE == iran && ( $PROTO == wss || $PROTO == wssmux ) ]]; then
+    if [[ $ROLE == iran && $CORE == backhaul && ( $PROTO == wss || $PROTO == wssmux ) ]]; then
         ensure_tls_cert || return 1
     fi
 
     start_ts=$(date '+%Y-%m-%d %H:%M:%S')
     info "Stopping old services (their own stop hooks remove old firewall rules)..."
     stop_services
-    # one-time cleanup of a v4.0 FRP install, if this box ever had one
+    # one-time cleanup of a v4.0 (ini-based) FRP install, if this box ever had one
     systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
     rm -f "$UNIT_DIR/$LEGACY_FRP_SVC" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"
     systemctl daemon-reload
     rm -f "$CONFIG_DIR/gretap-up.sh" "$CONFIG_DIR/gretap-down.sh" \
-          "$CONFIG_DIR/config.toml" "$CONFIG_DIR/frps.toml" "$CONFIG_DIR/frpc.toml"
+          "$CONFIG_DIR/config.toml" "$CONFIG_DIR/frp.toml" "$CONFIG_DIR/frps.toml" "$CONFIG_DIR/frpc.toml"
 
     save_conf
     write_core_conf
@@ -1117,8 +1390,16 @@ setup_tunnel() { # iran | kharej
 
     echo
     echo -e "${CYAN}Enter the SAME values on the other server:${NC}"
-    echo "  underlay: IPv$IP_VER | link type: $LINK_TYPE | IP pair: $TUN_IR_IP / $TUN_KH_IP | protocol: $PROTO | profile: $PROFILE | control port: $CTRL_PORT | token: $TOKEN"
-    info "The forwarded port list is only ever entered on the IRAN server - Kharej does not need it."
+    if [[ $LINK_TYPE == direct ]]; then
+        echo "  underlay: IPv$IP_VER | core: $CORE | link type: direct | protocol: $PROTO | profile: $PROFILE | control port: $CTRL_PORT | token: $TOKEN"
+    else
+        echo "  underlay: IPv$IP_VER | core: $CORE | link type: $LINK_TYPE | IP pair: $TUN_IR_IP / $TUN_KH_IP | protocol: $PROTO | profile: $PROFILE | control port: $CTRL_PORT | token: $TOKEN"
+    fi
+    if [[ $CORE == frp ]]; then
+        info "FRP needs its port list entered on BOTH servers (Iran for the allow-list, Kharej for the actual proxies) - unlike Backhaul, which only needs it on Iran."
+    else
+        info "The forwarded port list is only ever entered on the IRAN server - Kharej does not need it."
+    fi
     if [[ $ROLE == kharej ]]; then
         echo
         warn "The core forwards every tunneled port to 127.0.0.1:<target port> ON THIS (Kharej) MACHINE."
@@ -1138,7 +1419,7 @@ ctrl_ok() {
     local tcp udp
     tcp=$(ss -H -ltnp "sport = :$CTRL_PORT" 2>/dev/null | grep -c "$CORE_PROC")
     udp=$(ss -H -lunp "sport = :$CTRL_PORT" 2>/dev/null | grep -c "$CORE_PROC")
-    if [[ $PROTO == udp ]]; then (( udp > 0 )); else (( tcp > 0 )); fi
+    if ctrl_proto_is_udp; then (( udp > 0 )); else (( tcp > 0 )); fi
 }
 
 # instant check, no blocking wait: systemd (Restart=always) keeps retrying on
@@ -1175,7 +1456,7 @@ verify_setup() { # start_ts
             echo "       b) token or protocol differ between the two servers"
             echo "       c) the two servers run different binaries/versions (menu option 7)"
         elif grep -qiE "timeout|timed out" <<< "$log"; then
-            echo "    -> timeouts: packets get lost inside the tunnel (MTU / GRE filtering). Run Diagnose."
+            echo "    -> timeouts: packets get lost inside the tunnel (MTU / GRE filtering, or a blocked path in Direct mode). Run Diagnose."
         fi
     else
         res warn "No result yet - check again with menu option 3 / 4 in a few seconds."
@@ -1203,16 +1484,35 @@ client_state() { # up | down | unknown (based on recent client log lines)
 show_status() {
     load_conf || { err "Not configured yet - run option 1 or 2 first."; return 1; }
     echo -e "\n${CYAN}================ TUNNEL STATUS ($ROLE) ================${NC}"
-    echo "  Link       : $LINK_LABEL ($IFACE)   public: local $LOCAL_IP <-> peer $REMOTE_IP"
-    echo "  Tunnel IPs : $SELF_IP <-> $PEER_IP (/$PFX)"
+    if [[ -n $IFACE ]]; then
+        echo "  Link       : $LINK_LABEL ($IFACE)   public: local $LOCAL_IP <-> peer $REMOTE_IP"
+    else
+        echo "  Link       : $LINK_LABEL   public: local $LOCAL_IP <-> peer $REMOTE_IP"
+    fi
+    if [[ $LINK_TYPE == direct ]]; then
+        echo "  Addressing : direct (public IPs used as-is): $SELF_IP <-> $PEER_IP"
+    else
+        echo "  Tunnel IPs : $SELF_IP <-> $PEER_IP (/$PFX)"
+    fi
     echo "  Core       : $CORE_NAME   protocol: $PROTO   profile: $PROFILE_LABEL"
-    echo "  Control    : $TUN_IR_IP:$CTRL_PORT   MTU/MSS: $MTU_VAL/$MSS_VAL (fixed)"
+    if [[ $LINK_TYPE == direct ]]; then
+        echo "  Control    : $TUN_IR_IP:$CTRL_PORT   (direct mode: no MTU/MSS clamp applied)"
+    else
+        echo "  Control    : $TUN_IR_IP:$CTRL_PORT   MTU/MSS: $MTU_VAL/$MSS_VAL (fixed)"
+    fi
     if [[ -n ${PORTS:-} ]]; then
         echo "  Forwarded  : $PORTS   (TCP: $([[ $FWD_TCP == 1 ]] && echo yes || echo no), UDP: $([[ $FWD_UDP == 1 ]] && echo yes || echo no))"
     fi
 
     echo
-    if ip link show "$IFACE" >/dev/null 2>&1 && ip -4 addr show dev "$IFACE" | grep -q "inet $SELF_IP/"; then
+    if [[ $LINK_TYPE == direct ]]; then
+        echo -e "  ${CYAN}[*] Direct mode: no virtual interface is used; the public IP ($SELF_IP) is used as-is${NC}"
+        if ping -c 2 -W 2 "$PEER_IP" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}[*] ping $PEER_IP: SUCCESS${NC}"
+        else
+            echo -e "  ${RED}[x] ping $PEER_IP: FAILED${NC}"
+        fi
+    elif ip link show "$IFACE" >/dev/null 2>&1 && ip -4 addr show dev "$IFACE" | grep -q "inet $SELF_IP/"; then
         echo -e "  ${GREEN}[*] $IFACE: UP ($SELF_IP, mtu $(cat /sys/class/net/$IFACE/mtu 2>/dev/null))${NC}"
         if ping -c 2 -W 2 "$PEER_IP" >/dev/null 2>&1; then
             echo -e "  ${GREEN}[*] ping $PEER_IP: SUCCESS${NC}"
@@ -1271,7 +1571,14 @@ diagnose() {
     fi
 
     echo -e "\n${CYAN}3) $LINK_LABEL link${NC}"
-    if ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet $SELF_IP/"; then
+    if [[ $LINK_TYPE == direct ]]; then
+        res ok "Direct mode: no virtual interface is used; $SELF_IP (this host's own public IP) is used as-is"
+        if ping -c 2 -W 2 "$PEER_IP" >/dev/null 2>&1; then
+            res ok "ping $PEER_IP works"
+        else
+            res bad "ping $PEER_IP fails: check that $CTRL_PORT (and the forwarded ports) are reachable; the peer may simply block ICMP even if the tunnel itself works"
+        fi
+    elif ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet $SELF_IP/"; then
         res ok "$IFACE has $SELF_IP (mtu $(cat /sys/class/net/$IFACE/mtu 2>/dev/null))"
         if ! ip -d link show "$IFACE" 2>/dev/null | grep -q "remote $REMOTE_IP"; then
             res warn "$IFACE does not point at remote $REMOTE_IP (wrong peer IP, or the link type differs from the other server)"
@@ -1320,7 +1627,9 @@ diagnose() {
                 [[ $proto == tcp && $FWD_TCP != 1 ]] && continue
                 [[ $proto == udp && $FWD_UDP != 1 ]] && continue
                 fl="-ltnpH"; [[ $proto == udp ]] && fl="-lunpH"
-                if iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-p $proto .*--dport $pub .*BHGT"; then
+                if [[ $LINK_TYPE == direct ]]; then
+                    res ok "direct mode: no DNAT rule is needed for port $pub (checking the listener only)"
+                elif iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-p $proto .*--dport $pub .*BHGT"; then
                     res ok "$proto DNAT rule for port $pub present"
                 else
                     res bad "$proto DNAT rule for port $pub missing (menu 6 to reload)"
@@ -1340,14 +1649,14 @@ diagnose() {
         state=$(client_state)
         if [[ $state == up ]]; then
             res ok "Tunnel is established (client log); skipping the raw probe so it cannot disturb live traffic"
-        elif [[ $PROTO == udp ]]; then
-            res warn "UDP transport cannot be probed with a plain TCP connect - read the client log below"
+        elif ctrl_proto_is_udp; then
+            res warn "UDP-based transport ($PROTO) cannot be probed with a plain TCP connect - read the client log below"
         else
             timeout 3 bash -c "exec 3<>/dev/tcp/$PEER_IP/$CTRL_PORT" 2>/dev/null
             rc=$?
             case $rc in
                 0)   res warn "TCP connect to $PEER_IP:$CTRL_PORT works but no tunnel is established -> the program there hangs up (port owner / token / protocol / binary mismatch). Run Diagnose on the IRAN server." ;;
-                124) res bad "TCP connect to $PEER_IP:$CTRL_PORT TIMED OUT (packets dropped inside the tunnel: MTU/firewall)" ;;
+                124) res bad "TCP connect to $PEER_IP:$CTRL_PORT TIMED OUT (packets dropped: MTU/firewall, or a blocked path in Direct mode)" ;;
                 *)   res bad "TCP connect to $PEER_IP:$CTRL_PORT REFUSED: nothing listens there (Iran $CORE_NAME not running / different port)" ;;
             esac
         fi
@@ -1383,8 +1692,8 @@ diagnose() {
 
     echo -e "\n${CYAN}How to read common errors${NC}"
     echo "    'failed to read message length ... EOF' on the Kharej client: the TCP connection worked, then the other end"
-    echo "    closed it at once. With matching tokens the thing answering is not your Backhaul server (port owner, see Iran"
-    echo "    step 4), uses another protocol, or is a different Backhaul build (compare sha256 in step 1 on both servers)."
+    echo "    closed it at once. With matching tokens the thing answering is not your core server (port owner, see Iran"
+    echo "    step 4), uses another protocol, or is a different build (compare sha256 in step 1 on both servers)."
     echo -e "${CYAN}======================================================${NC}\n"
 }
 
@@ -1393,9 +1702,12 @@ diagnose() {
 # ------------------------------------------------------------------------------
 update_ports() {
     load_conf || { err "Not configured yet."; return 1; }
-    if [[ $ROLE != iran ]]; then
-        err "Forwarded ports are configured on the IRAN server only - nothing to update here on Kharej."
+    if [[ $ROLE != iran && $CORE != frp ]]; then
+        err "Forwarded ports are configured on the IRAN server only for $CORE_NAME - nothing to update here on Kharej."
         return 1
+    fi
+    if [[ $ROLE != iran ]]; then
+        info "FRP: updating the port list on the KHAREJ client (frpc owns the proxy definitions)."
     fi
     info "Current forwarded ports: ${PORTS:-none}"
     prompt_ports
@@ -1442,18 +1754,18 @@ uninstall_all() {
     echo
     warn "This removes the tunnel, services, firewall rules and config of THIS tunnel only."
     ask_yn "Really uninstall?" n || return 0
-    systemctl stop "$BACKHAUL_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
-    systemctl disable "$BACKHAUL_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
-    for b in "$BACKHAUL_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"; do
+    systemctl stop "$BACKHAUL_SVC" "$FRP_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
+    systemctl disable "$BACKHAUL_SVC" "$FRP_SVC" "$LEGACY_FRP_SVC" "$LINK_SVC" >/dev/null 2>&1
+    for b in "$BACKHAUL_BIN" "$FRPS_BIN" "$FRPC_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"; do
         pkill -f -- "$b -c $CONFIG_DIR/" 2>/dev/null
     done
     [[ -x $CTL_SH ]] && "$CTL_SH" down
-    rm -f "$UNIT_DIR/$BACKHAUL_SVC" "$UNIT_DIR/$LEGACY_FRP_SVC" "$UNIT_DIR/$LINK_SVC"
+    rm -f "$UNIT_DIR/$BACKHAUL_SVC" "$UNIT_DIR/$FRP_SVC" "$UNIT_DIR/$LEGACY_FRP_SVC" "$UNIT_DIR/$LINK_SVC"
     systemctl daemon-reload
     ip link del gretun1 2>/dev/null
     ip link del gretap1 2>/dev/null
     rm -rf "$CONFIG_DIR"
-    rm -f "$BACKHAUL_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"
+    rm -f "$BACKHAUL_BIN" "$FRPS_BIN" "$FRPC_BIN" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"
     ok "Tunnel, services and firewall rules removed (the shared $LEGACY_BIN, if any, was not touched)."
 }
 
@@ -1462,9 +1774,9 @@ main_menu() {
     while true; do
         clear
         echo -e "${CYAN}========================================================${NC}"
-        echo -e "${GREEN}   GRE/GRETAP + Backhaul Reverse Tunnel Manager v$VERSION  ${NC}"
+        echo -e "${GREEN}   GRE/GRETAP/Direct + Backhaul/FRP Tunnel Manager v$VERSION  ${NC}"
         if load_conf 2>/dev/null; then
-            echo -e "${CYAN}   Active: $ROLE | $LINK_LABEL | $PROTO/$PROFILE | $SELF_IP${NC}"
+            echo -e "${CYAN}   Active: $ROLE | $CORE_NAME | $LINK_LABEL | $PROTO/$PROFILE | $SELF_IP${NC}"
         else
             echo -e "${CYAN}   Not configured yet${NC}"
         fi
@@ -1473,7 +1785,7 @@ main_menu() {
         echo -e " 2) Configure ${YELLOW}KHAREJ Client${NC} (link + core client)"
         echo -e " 3) Status & logs"
         echo -e " 4) Diagnose connection  ${CYAN}(use this when something fails)${NC}"
-        echo -e " 5) Update forwarded ports (Iran server only)"
+        echo -e " 5) Update forwarded ports"
         echo -e " 6) Restart tunnel services"
         echo -e " 7) Check / reinstall core binary (version + sha256)"
         echo -e " 8) Follow live core log (Ctrl+C to stop)"
