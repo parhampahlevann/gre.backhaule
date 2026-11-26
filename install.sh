@@ -1,113 +1,45 @@
 #!/bin/bash
 # ==============================================================================
-# GRE / GRETAP / Direct + Backhaul/FRP  Reverse Tunnel Manager  v6.0
+# GRE / GRETAP / Direct + Backhaul/FRP  Reverse Tunnel Manager  v6.2
 #
 #   Iran  server : TUN_IR_IP   <== GRE, GRETAP or Direct (MTU/MSS fixed in GRE/GRETAP) ==>   Kharej client : TUN_KH_IP
 #
 # Data path
-#   user -> Iran public IP:PORT --(iptables DNAT, or none in Direct mode)--> TUN_IR_IP:PORT (core server)
+#   user (IPv4 or IPv6) -> Iran public IP:PORT (core dual-stack [::]:PORT listener)
 #        -> core control + data channels travel INSIDE the GRE/GRETAP link, or straight
 #           over the public IP when Direct mode is used
 #        -> core client on Kharej -> 127.0.0.1:TARGET_PORT on the Kharej box
 #
-# New in v5.0
-#   1. FRP core removed (brought back in v6.0, see below). This version was Backhaul-only.
-#   2. Connection profile is chosen at setup, same on both sides:
-#        gaming / fast / balance / turbo - tunes the core's own keepalive,
-#        heartbeat, channel/mux buffer sizes, pool size and reconnect timers.
-#   3. MTU/MSS are a single fixed pair (not tied to profile or protocol),
-#      so they are always identical on Iran and Kharej no matter which
-#      profile each admin happens to pick.
-#   4. Setup no longer blocks for up to 15-25 seconds waiting for the tunnel
-#      to come up: it does one instant check and hands control back; use
-#      menu option 3/4 a few seconds later to confirm (Restart=always keeps
-#      retrying in the background either way).
-#   5. Link type is chosen at setup: GRE (layer 3) or GRETAP (layer 2).
-#   6. Local tunnel IP pair is chosen at setup:
-#        1) 10.0.0.1 (Iran)     <-> 10.0.0.2 (Kharej)      /30
-#        2) 203.0.113.10 (Iran) <-> 203.0.113.20 (Kharej)  /27
-#   7. Protocol is chosen manually, per core (see below).
-#   8. Forwarded ports are handled on the Iran server for Backhaul (iptables
-#      DNAT to the tunnel IP + INPUT accept, tagged BHGT) - Kharej is never
-#      asked. FRP works differently, see "New in v6.0" below.
-#
-# New in v5.1
-#   * Underlay IP version is now asked at setup (same choice on both servers):
-#       IPv4 -> gre/gretap  (unchanged)
-#       IPv6 -> ip6gre/ip6gretap, firewall accept rule moves to ip6tables
-#     This only affects LOCAL_IP/REMOTE_IP (the two servers' own public IPs
-#     used to build the GRE/GRETAP link). The private inner tunnel addresses
-#     (TUN_IR_IP/TUN_KH_IP, still picked from the usual IP-pair menu unless
-#     Direct mode is used) and the forwarded-port DNAT rules stay IPv4 either
-#     way - a GRE/GRETAP tunnel carries whatever inner payload it's given
-#     regardless of which IP family encapsulates it, so nothing else changed.
-#
-# New in v6.0
-#   1. Link type has a 3rd choice: Direct. No GRE/GRETAP interface is created
-#      and no local tunnel IP pair is asked - the core binds/connects straight
-#      on the chosen underlay public IP (LOCAL_IP/REMOTE_IP). Works with IPv4
-#      or IPv6, but it is most useful with IPv6: the core talks directly over
-#      the public IPv6 address instead of riding inside an extra GRE header.
-#      MTU/MSS clamping and the GRE accept rule are skipped in this mode;
-#      the control port and forwarded ports just get a plain firewall accept
-#      (DNAT is unnecessary because the core already binds the real public IP).
-#   2. A second core is available: FRP v0.61.1, picked at setup with the exact
-#      same workflow as Backhaul (same link-type/IP-pair/profile/token/port
-#      steps). Its own protocol set: tcp, kcp, quic, websocket, wss.
-#      IMPORTANT difference from Backhaul: Backhaul's "ports" list is a
-#      server-only (Iran) setting, but FRP's client (frpc) is what declares
-#      each forwarded port ([[proxies]]), not the server. So when FRP is
-#      selected, the SAME port list must be entered on BOTH servers: on Iran
-#      it becomes the server's allow-list (allowPorts), and on Kharej it
-#      becomes the actual proxy definitions. This is a protocol requirement
-#      of FRP itself, not a UX inconsistency - Setup prints a clear note
-#      about it on the Kharej side so it isn't mistaken for a bug.
-#
-# Things verified against the real binaries (Backhaul/Musixal docs, frp docs)
-#   * Backhaul: "ports" is configured on the [server] (Iran) side only; the
-#     client never needs a port list - that was purely an FRP(v4.0-ini) quirk.
-#   * Backhaul "udp" transport forwards UDP ports ONLY (no TCP listener).
-#   * Backhaul accept_udp (UDP-over-TCP) works with "tcp" but NOT "tcpmux".
-#   * FRP: frps' proxyBindAddr defaults to its bindAddr, so binding frps to
-#     the private tunnel IP (same trick used for Backhaul) still requires a
-#     DNAT from the public NIC in GRE/GRETAP mode, exactly like Backhaul.
-#   * FRP: transport.tls.enable defaults to true since v0.50.0 - "wss" needs
-#     no manually generated certificate, unlike Backhaul's wss/wssmux.
-#   * Core logs are colored: ANSI codes are stripped before matching.
-#
-# Upgrade note: config dir and service names of older versions are kept on
-# purpose, so an older install is still shown by Status and replaced cleanly
-# by Setup. Leftover frps/frpc services and binaries from a v4.0 (ini-based,
-# unversioned) FRP setup are removed automatically the next time Setup
-# (menu 1/2) or Uninstall (menu 9) runs - this is unrelated to the new,
-# supported FRP v0.61.1 core added in v6.0, which uses different binary
-# paths and is never touched by that legacy cleanup.
-#
-# Fixed in v6.1
-#   1. write_backhaul_conf now brackets the inner tunnel IP whenever it's
-#      IPv6 (bind_addr / remote_addr / each "ports" entry). Direct mode with
-#      an IPv6 underlay set TUN_IR_IP to a bare IPv6 literal, so the config
-#      ended up with e.g. "2001:db8::1:3080" instead of "[2001:db8::1]:3080".
-#      Backhaul's TOML/Go address parser rejects that outright, so the Iran
-#      (and Kharej) service crash-looped on every start and never showed up
-#      as active/listening - this is why Backhaul never went active on the
-#      Iran log over IPv6. A bracket_addr() helper already existed for this
-#      exact purpose but was never actually called anywhere - it is now.
-#   2. apply_rules (inside gretap-ctl.sh) used plain iptables for the
-#      Direct-mode control-port/forwarded-port ACCEPT rules even when the
-#      bound address was IPv6, which iptables can't parse - the rule failed
-#      silently (stderr was discarded) and the port was simply never opened.
-#      A new fw_accept_dport() helper now picks iptables or ip6tables based
-#      on whether the address is IPv6.
-#   3. listener_conflicts compared ss's address against TUN_IR_IP without
-#      accounting for ss printing IPv6 addresses in bracket form ([addr]),
-#      so a genuine port conflict on an IPv6 Direct address was never
-#      detected before setup. Fixed to compare against both forms.
-#   4. Status/Diagnose now ping with "-6" for IPv6 targets (ping_peer()),
-#      instead of relying on a bare "ping" to auto-detect the family.
+# Fixed in v6.2
+#   1. Dual-stack IPv4+IPv6 port forwarding on Iran for BOTH Backhaul and FRP
+#      across ALL link types (Direct, GRE, GRETAP):
+#      - Control port stays strictly isolated on TUN_IR_IP:CTRL_PORT.
+#      - Forwarded ports bind dual-stack [::]:PORT (with net.ipv6.bindv6only=0)
+#        for Backhaul ("[::]:pub=127.0.0.1:tgt") and FRP (proxyBindAddr = "::"),
+#        falling back to 0.0.0.0 only if IPv6 is disabled in the kernel.
+#      - Both iptables and ip6tables INPUT rules are opened for forwarded ports.
+#   2. IPv6 GRE/GRETAP connectivity fixes:
+#      - Added `ip -6 link add ... hoplimit 255 encaplimit none` + `ip6_tunnel`
+#        module so Linux does not prepend an IPv6 DSTOPS extension header that
+#        breaks ip6tables GRE matching and ISP/DC filters.
+#      - Adjusted IPv6 GRE/GRETAP MTU to 1360 (MSS stays fixed at 1240) to avoid
+#        IPv6 outer-packet MTU black-holing (IPv6 routers never fragment).
+#      - Added `net.ipv4.conf.all.rp_filter=0` (Linux uses max(all, iface)).
+#      - Opened IPv6 protocol 47 (INPUT/OUTPUT) and ICMPv6 (for PMTUD/NDP).
+#   3. Fixed `ipt6_filter_ensure` putting `-m comment` after `-j ACCEPT`, which
+#      caused rule insertion/check/purge failures on ip6tables-nft. `purge_rules`
+#      now always cleans both iptables and ip6tables tags regardless of IP_VER.
+#   4. Fixed FRP `transport.tcpMux` mismatch on gaming/balance profiles (frps
+#      defaulted to true while frpc set false -> instant EOF), synced
+#      `transport.heartbeatTimeout`, and checked both TCP+UDP for FRP kcp/quic
+#      control port conflicts.
+#   5. Fixed IPv6 `prestart` (uses `ping -6`, waits for non-tentative IPv6 DAD
+#      on Iran Direct mode), canonicalized IPv6 addresses (RFC 5952), improved
+#      `detect_ip` IPv6 fallback, and skipped Iran-only port-conflict checks
+#      when entering FRP ports on Kharej.
 # ==============================================================================
 
-VERSION="6.1"
+VERSION="6.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -129,7 +61,7 @@ LEGACY_FRPS_BIN="/usr/local/bin/frps-gretap"
 LEGACY_FRPC_BIN="/usr/local/bin/frpc-gretap"
 LEGACY_FRP_SVC="frp-tunnel.service"
 
-# the new, supported FRP core (v6.0)
+# the new, supported FRP core (v6.0+)
 FRP_VERSION="0.61.1"
 FRPS_BIN="/usr/local/bin/frps-core"
 FRPC_BIN="/usr/local/bin/frpc-core"
@@ -139,11 +71,13 @@ LINK_SVC="gretap-tunnel.service"
 BACKHAUL_SVC="backhaul-tunnel.service"
 FRP_SVC="frp-tunnel.service"
 
-# MTU/MSS are fixed and NEVER change with protocol, profile or core, so they
-# are always identical on Iran and Kharej no matter what else differs. They
-# only apply to GRE/GRETAP link types (Direct mode has no extra header).
+# MTU/MSS are fixed per underlay IP version and NEVER change with protocol,
+# profile or core, so they are always identical on Iran and Kharej. They only
+# apply to GRE/GRETAP link types (Direct mode has no extra header).
 MSS_VAL="1240"
-MTU_VAL="1400"
+MTU_VAL_V4="1400"
+MTU_VAL_V6="1360"
+MTU_VAL="$MTU_VAL_V4"
 
 # local tunnel IP pairs (index 0 = option 1, index 1 = option 2) - unused in Direct mode
 IPSET_IR=("10.0.0.1"  "203.0.113.10")
@@ -262,8 +196,7 @@ valid_ipv4() {
     done
     return 0
 }
-# IPv6 validation: delegate to python3's ipaddress module when available (authoritative),
-# otherwise fall back to a loose structural check (hex groups, at most one "::").
+
 valid_ipv6() {
     local ip=$1
     [[ $ip == *:* ]] || return 1
@@ -287,6 +220,22 @@ except Exception:
     done
     return 0
 }
+
+# Canonicalize IPv6 addresses to compressed lowercase (RFC 5952) so comparisons
+# against kernel/ss/ip/ip6tables output always match. IPv4 is returned as-is.
+canon_ip() {
+    local ip=$1
+    if [[ $ip == *:* ]]; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c 'import ipaddress,sys; print(ipaddress.IPv6Address(sys.argv[1]).compressed)' "$ip" 2>/dev/null || echo "${ip,,}"
+        else
+            echo "${ip,,}"
+        fi
+    else
+        echo "$ip"
+    fi
+}
+
 valid_port()  { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 valid_token() { [[ $1 =~ ^[A-Za-z0-9._~@%+=-]{1,64}$ ]]; }
 MENU_MAX=1
@@ -294,33 +243,39 @@ valid_menu()  { [[ $1 =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 1 && 10#$1 <= MENU_MAX )
 
 strip_ansi() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g'; }
 
+# Is IPv6 enabled in the kernel on this machine?
+has_ipv6() {
+    [[ -f /proc/net/if_inet6 ]] && [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) != 1 ]]
+}
+
 # detect this host's own outbound address for the chosen underlay IP version
-# (IP_VER is set by choose_ipver / load_conf before this is called)
 detect_ip() {
+    local ip=""
     if [[ ${IP_VER:-4} == 6 ]]; then
-        ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* src \([0-9A-Fa-f:]*\).*/\1/p' | head -n1
+        ip=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* src \([0-9A-Fa-f:]*\).*/\1/p' | head -n1)
+        [[ -z $ip || $ip == fe80:* ]] && ip=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | sed -n 's/.* src \([0-9A-Fa-f:]*\).*/\1/p' | head -n1)
+        [[ -z $ip || $ip == fe80:* ]] && ip=$(ip -6 -o addr show scope global 2>/dev/null | awk '!/temporary|deprecated/{split($4,a,"/"); print a[1]; exit}')
+        [[ -n $ip ]] && canon_ip "$ip"
     else
-        ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+        [[ -z $ip ]] && ip=$(ip -4 route get 8.8.8.8 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+        echo "$ip"
     fi
 }
 
 # bracket an address for a "host:port" string, only if it's IPv6 (contains ':').
-# Needed anywhere TUN_IR_IP/PEER_IP is concatenated with a port into one string
-# (Direct mode can make these IPv6; GRE/GRETAP mode never does).
 bracket_addr() { [[ $1 == *:* ]] && echo "[$1]" || echo "$1"; }
 
-# ping a peer with the right address family (plain "ping" cannot be trusted to
-# auto-detect IPv6 on every distro/build) - used by Status/Diagnose.
+# ping a peer with the right address family
 ping_peer() { # target [extra ping args...]
     local tgt=$1
     shift
-    local -a fam=()
+    local -a fam=(-4)
     [[ $tgt == *:* ]] && fam=(-6)
     ping "${fam[@]}" "$@" "$tgt"
 }
 
 # is the control-channel wire protocol UDP-based for the chosen core?
-# (Backhaul's "udp" transport, or FRP's "kcp"/"quic" transports)
 ctrl_proto_is_udp() {
     if [[ $CORE == frp ]]; then
         [[ $PROTO == kcp || $PROTO == quic ]]
@@ -330,7 +285,6 @@ ctrl_proto_is_udp() {
 }
 
 # parse_ports "1080, 443, 8443=443" -> PORT_MAP=("1080=1080" "443=443" "8443=443")
-# entry "A" means public port A -> Kharej 127.0.0.1:A ; "A=B" means public A -> Kharej 127.0.0.1:B
 parse_ports() {
     local raw=${1//[[:space:]]/} entry pub tgt
     local -a entries=()
@@ -363,18 +317,22 @@ parse_ports() {
     (( ${#PORT_MAP[@]} > 0 ))
 }
 
-# listeners that would clash with a core binding TUN_IR_IP:port (wildcard or same IP),
-# ignoring our own tunnel processes. Prints "addr process" per clash.
-listener_conflicts() { # proto port
-    local flags="-ltnpH"
+# listeners that would clash with a core binding a port, ignoring our own tunnel
+# processes. scope=any (default for dual-stack wildcard forwarded ports) flags
+# any listener on that port; scope=bind checks wildcard or TUN_IR_IP.
+listener_conflicts() { # proto port [any|bind]
+    local flags="-ltnpH" scope=${3:-bind}
     [[ $1 == udp ]] && flags="-lunpH"
-    local laddr proc tun_ir_br
+    local laddr proc tun_ir_br host
     tun_ir_br=$(bracket_addr "${TUN_IR_IP:-}")
     ss $flags "sport = :$2" 2>/dev/null | while read -r _ _ _ laddr _ proc; do
-        case ${laddr%:*} in
-            "*"|0.0.0.0|"[::]"|"::"|"$TUN_IR_IP"|"$tun_ir_br") ;;
-            *) continue ;;
-        esac
+        host=${laddr%:*}
+        if [[ $scope != any ]]; then
+            case $host in
+                "*"|0.0.0.0|"[::]"|"::"|"$TUN_IR_IP"|"$tun_ir_br") ;;
+                *) continue ;;
+            esac
+        fi
         case $proc in
             *'"backhaul-gretap"'*|*'"frps-gretap"'*|*'"frpc-gretap"'*|*'"frps-core"'*|*'"frpc-core"'*) continue ;;
         esac
@@ -382,13 +340,17 @@ listener_conflicts() { # proto port
     done
 }
 
-# conflicts on the control port, depending on the chosen core/protocol
+# conflicts on the control port, depending on the chosen core/protocol.
+# Note: FRP always opens TCP bindPort even when kcpBindPort/quicBindPort is used.
 ctrl_conflicts() {
     {
-        if ctrl_proto_is_udp; then
-            listener_conflicts udp "$CTRL_PORT" | sed 's/^/udp: /'
+        if [[ $CORE == frp && ( $PROTO == kcp || $PROTO == quic ) ]]; then
+            listener_conflicts tcp "$CTRL_PORT" bind | sed 's/^/tcp: /'
+            listener_conflicts udp "$CTRL_PORT" bind | sed 's/^/udp: /'
+        elif ctrl_proto_is_udp; then
+            listener_conflicts udp "$CTRL_PORT" bind | sed 's/^/udp: /'
         else
-            listener_conflicts tcp "$CTRL_PORT" | sed 's/^/tcp: /'
+            listener_conflicts tcp "$CTRL_PORT" bind | sed 's/^/tcp: /'
         fi
     } | sed '/^$/d'
 }
@@ -397,7 +359,7 @@ pick_free_port() {
     local i p
     for i in $(seq 1 60); do
         p=$(( (RANDOM % 20000) + 20000 ))
-        [[ -z $(ss -H -ltn "sport = :$p" 2>/dev/null) ]] && { echo "$p"; return; }
+        [[ -z $(ss -H -ltn "sport = :$p" 2>/dev/null) && -z $(ss -H -lun "sport = :$p" 2>/dev/null) ]] && { echo "$p"; return; }
     done
     echo 28080
 }
@@ -407,6 +369,11 @@ pick_free_port() {
 # ------------------------------------------------------------------------------
 set_link_vars() {
     IP_VER=${IP_VER:-4}
+    if [[ $IP_VER == 6 ]]; then
+        MTU_VAL="$MTU_VAL_V6"
+    else
+        MTU_VAL="$MTU_VAL_V4"
+    fi
     case ${LINK_TYPE:-gretap} in
         gre)    LINK_TYPE=gre;    IFACE="gretun1" ;;
         direct) LINK_TYPE=direct; IFACE="" ;;
@@ -424,6 +391,11 @@ set_link_vars() {
             gre) LINK_LABEL="GRE (layer 3)" ;;
             *)   LINK_LABEL="GRETAP (layer 2)" ;;
         esac
+    fi
+    if has_ipv6; then
+        FWD_BIND_IP="::"
+    else
+        FWD_BIND_IP="0.0.0.0"
     fi
 }
 
@@ -444,8 +416,8 @@ set_core_vars() {
             CORE=backhaul
             CORE_NAME="Backhaul"
             CORE_SVC=$BACKHAUL_SVC
-            LOG_OK_RE='channel established'
-            LOG_ERR_RE='\[(ERROR|WARNING)\]'
+            LOG_OK_RE='channel established|connected successfully|tunnel established'
+            LOG_ERR_RE='(\[(ERROR|WARNING|ERR|WARN)\]|level=(error|warn))'
             CORE_BIN=$BACKHAUL_BIN
             CORE_TAR_NAME="backhaul"
             CORE_CONF="$CONFIG_DIR/config.toml"
@@ -465,8 +437,6 @@ set_role_ips() {
 }
 
 # which transport protocols of the forwarded ports are used (firewall)
-# TCP is always on; UDP is only added when ACCEPT_UDP was confirmed, EXCEPT
-# Backhaul's "udp" transport, which forwards UDP ports only (no TCP at all).
 set_fwd_flags() {
     FWD_TCP=1
     FWD_UDP=${ACCEPT_UDP:-0}
@@ -476,10 +446,7 @@ set_fwd_flags() {
     fi
 }
 
-# connection profile -> tuning knobs for whichever core is active. MTU/MSS are
-# NOT part of this on purpose (see MSS_VAL/MTU_VAL above) so they stay fixed
-# no matter which profile is picked on either side, and only ever apply to
-# GRE/GRETAP link types.
+# connection profile -> tuning knobs for whichever core is active.
 set_profile_vars() {
     case ${PROFILE:-balance} in
         gaming)
@@ -532,6 +499,7 @@ save_conf() {
         printf 'PFX=%q\n'        "${PFX:-}"
         printf 'SELF_IP=%q\n'    "$SELF_IP"
         printf 'PEER_IP=%q\n'    "$PEER_IP"
+        printf 'FWD_BIND_IP=%q\n' "${FWD_BIND_IP:-::}"
         printf 'CTRL_PORT=%q\n'  "$CTRL_PORT"
         printf 'TOKEN=%q\n'      "$TOKEN"
         printf 'PROTO=%q\n'      "$PROTO"
@@ -568,6 +536,10 @@ load_conf() {
     PROFILE=${PROFILE:-balance}
     IP_VER=${IP_VER:-4}
     CORE=${CORE:-backhaul}
+    LOCAL_IP=$(canon_ip "${LOCAL_IP:-}")
+    REMOTE_IP=$(canon_ip "${REMOTE_IP:-}")
+    TUN_IR_IP=$(canon_ip "$TUN_IR_IP")
+    TUN_KH_IP=$(canon_ip "$TUN_KH_IP")
     set_link_vars
     set_core_vars
     set_role_ips
@@ -580,7 +552,8 @@ load_conf() {
 # core configuration files (always regenerated from tunnel.conf)
 # ------------------------------------------------------------------------------
 write_backhaul_conf() {
-    local m
+    local m pub tgt fwd_br
+    fwd_br=$(bracket_addr "${FWD_BIND_IP:-0.0.0.0}")
     {
         if [[ $ROLE == iran ]]; then
             echo "[server]"
@@ -611,7 +584,12 @@ write_backhaul_conf() {
             esac
             echo "ports = ["
             for m in $PORTS; do
-                echo "    \"$(bracket_addr "$TUN_IR_IP"):${m%%=*}=${m#*=}\","
+                pub=${m%%=*}
+                tgt=${m#*=}
+                # Bind dual-stack [::]:pub (or 0.0.0.0:pub if IPv6 is disabled) so both
+                # IPv4 and IPv6 clients hitting Iran are accepted and forwarded to
+                # 127.0.0.1:tgt on Kharej, while the control channel stays on TUN_IR_IP.
+                echo "    \"${fwd_br}:${pub}=127.0.0.1:${tgt}\","
             done
             echo "]"
         else
@@ -639,19 +617,22 @@ write_backhaul_conf() {
     } > "$CORE_CONF"
 }
 
-# FRP TOML config. frps' proxyBindAddr defaults to its bindAddr, so binding
-# bindAddr to TUN_IR_IP (the private tunnel IP, or the real public IP in
-# Direct mode) makes the forwarded-port listeners land on the same address
-# as the control port - exactly like Backhaul's bind_addr trick, so the same
-# DNAT firewall rules in gretap-ctl.sh work unmodified for either core.
+# FRP TOML config.
+# Control plane binds bindAddr (TUN_IR_IP - isolated inside GRE/GRETAP or public
+# IP in Direct mode). Forwarded ports bind proxyBindAddr (dual-stack "::" when
+# IPv6 is enabled, or "0.0.0.0" otherwise) so BOTH IPv4 and IPv6 public traffic
+# hitting Iran is forwarded cleanly across any tunnel type.
 write_frp_conf() {
     local m pub tgt
     {
         if [[ $ROLE == iran ]]; then
             echo "bindAddr = \"$TUN_IR_IP\""
             echo "bindPort = $CTRL_PORT"
+            echo "proxyBindAddr = \"${FWD_BIND_IP:-0.0.0.0}\""
             [[ $PROTO == kcp  ]] && echo "kcpBindPort = $CTRL_PORT"
             [[ $PROTO == quic ]] && echo "quicBindPort = $CTRL_PORT"
+            echo "transport.tcpMux = ${FRP_TCP_MUX:-false}"
+            echo "transport.heartbeatTimeout = ${FRP_HB_TIMEOUT:-90}"
             echo "auth.method = \"token\""
             echo "auth.token = \"$TOKEN\""
             echo "log.level = \"info\""
@@ -730,19 +711,18 @@ FWD_TCP=${FWD_TCP:-1}
 FWD_UDP=${FWD_UDP:-${ACCEPT_UDP:-0}}
 CORE=${CORE:-backhaul}
 CORE_BIN=${CORE_BIN:-${BACKHAUL_BIN:-}}
+MTU_VAL=${MTU_VAL:-$([[ $IP_VER == 6 ]] && echo 1360 || echo 1400)}
 
 TAG="BHGT"
-# IPT4 handles every rule that matches on the DECAPSULATED inner traffic (which is
-# always IPv4 - the TUN_IR_IP/TUN_KH_IP private pair, or the real public IPv4/IPv6
-# address in Direct mode - no matter which underlay is used). IPT6 is only used
-# for the one rule that accepts the raw, still-encapsulated GRE packet itself when
-# the underlay (LOCAL_IP/REMOTE_IP) is IPv6 (never applies in Direct mode), and for
-# any Direct-mode rule whose bound address (TUN_IR_IP) happens to be IPv6.
 if iptables -w 5 -L -n >/dev/null 2>&1; then IPT4=(iptables -w 5); else IPT4=(iptables); fi
 IPT6=()
-if [[ $IP_VER == 6 ]]; then
+if command -v ip6tables >/dev/null 2>&1; then
     if ip6tables -w 5 -L -n >/dev/null 2>&1; then IPT6=(ip6tables -w 5); else IPT6=(ip6tables); fi
 fi
+
+has_ipv6() {
+    [[ -f /proc/net/if_inet6 ]] && [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) != 1 ]]
+}
 
 # is the control-channel wire protocol UDP-based for the chosen core?
 ctrl_is_udp() {
@@ -767,30 +747,40 @@ ipt_ensure() {
     "${IPT4[@]}" -t "$t" -C "$c" "${spec[@]}" 2>/dev/null || "${IPT4[@]}" -t "$t" -I "$c" 1 "${spec[@]}"
 }
 
-# same, but always on IPT6 filter table - only used for the raw GRE-over-IPv6 accept rule
-ipt6_filter_ensure() {
-    local c=$1
-    shift
-    local -a spec=("$@" -m comment --comment "$TAG")
-    "${IPT6[@]}" -t filter -C "$c" "${spec[@]}" 2>/dev/null || "${IPT6[@]}" -t filter -I "$c" 1 "${spec[@]}"
+# ipt6_ensure <table> <chain> <match/target args...>  (idempotent, inserted at top, tagged, IPT6)
+# Places -m comment BEFORE -j so ip6tables-nft / ip6tables-legacy match/check/purge cleanly.
+ipt6_ensure() {
+    (( ${#IPT6[@]} > 0 )) || return 0
+    local t=$1 c=$2
+    shift 2
+    local -a pre=() post=() spec=()
+    while (( $# )); do
+        if [[ $1 == -j ]]; then post=("$@"); break; fi
+        pre+=("$1")
+        shift
+    done
+    spec=("${pre[@]}" -m comment --comment "$TAG" "${post[@]}")
+    "${IPT6[@]}" -t "$t" -C "$c" "${spec[@]}" 2>/dev/null || "${IPT6[@]}" -t "$t" -I "$c" 1 "${spec[@]}"
 }
 
-# INPUT ACCEPT for one protocol/dest-port on $1, auto-picking iptables or
-# ip6tables depending on whether $1 is an IPv6 literal. iptables cannot parse
-# an IPv6 -d argument (it fails silently since callers redirect stderr), so a
-# Direct-mode rule bound to an IPv6 TUN_IR_IP must go through ip6tables
-# instead - GRE/GRETAP mode never hits the IPv6 branch here since TUN_IR_IP
-# stays IPv4 in that mode regardless of the underlay.
-fw_accept_dport() { # dst proto port
+# INPUT ACCEPT for a specific destination address ($1), auto-picking iptables or ip6tables.
+fw_accept_dst_dport() { # dst proto port
     if [[ $1 == *:* ]]; then
-        [[ ${#IPT6[@]} -gt 0 ]] || { if ip6tables -w 5 -L -n >/dev/null 2>&1; then IPT6=(ip6tables -w 5); else IPT6=(ip6tables); fi; }
-        ipt6_filter_ensure INPUT -d "$1" -p "$2" --dport "$3" -j ACCEPT
+        ipt6_ensure filter INPUT -d "$1" -p "$2" --dport "$3" -j ACCEPT
     else
         ipt_ensure filter INPUT -d "$1" -p "$2" --dport "$3" -j ACCEPT
     fi
 }
 
-# remove every rule carrying our tag, whatever the current config says
+# INPUT ACCEPT for a dual-stack forwarded port on both IPv4 and IPv6 (when available).
+fw_accept_fwd_port() { # proto port
+    ipt_ensure filter INPUT -p "$1" --dport "$2" -j ACCEPT
+    if has_ipv6 && (( ${#IPT6[@]} > 0 )); then
+        ipt6_ensure filter INPUT -p "$1" --dport "$2" -j ACCEPT
+    fi
+}
+
+# remove every rule carrying our tag from both iptables and ip6tables
 purge_rules() {
     local t line
     local -a words=()
@@ -801,19 +791,18 @@ purge_rules() {
             line="-D${line#-A}"
             read -ra words <<< "$line"
             "${IPT4[@]}" -t "$t" "${words[@]}" 2>/dev/null
-        done < <("${IPT4[@]}" -t "$t" -S 2>/dev/null | grep -E -- "--comment \"?$TAG\"? ")
+        done < <("${IPT4[@]}" -t "$t" -S 2>/dev/null | grep -E -- "--comment \"?$TAG\"?( |$)")
     done
-    if [[ $IP_VER == 6 || ${#IPT6[@]} -gt 0 ]]; then
-        if [[ ${#IPT6[@]} -eq 0 ]]; then
-            if ip6tables -w 5 -L -n >/dev/null 2>&1; then IPT6=(ip6tables -w 5); else IPT6=(ip6tables); fi
-        fi
-        while read -r line; do
-            [[ -n $line ]] || continue
-            line=${line//\"/}
-            line="-D${line#-A}"
-            read -ra words <<< "$line"
-            "${IPT6[@]}" -t filter "${words[@]}" 2>/dev/null
-        done < <("${IPT6[@]}" -t filter -S 2>/dev/null | grep -E -- "--comment \"?$TAG\"? ")
+    if (( ${#IPT6[@]} > 0 )); then
+        for t in filter nat mangle; do
+            while read -r line; do
+                [[ -n $line ]] || continue
+                line=${line//\"/}
+                line="-D${line#-A}"
+                read -ra words <<< "$line"
+                "${IPT6[@]}" -t "$t" "${words[@]}" 2>/dev/null
+            done < <("${IPT6[@]}" -t "$t" -S 2>/dev/null | grep -E -- "--comment \"?$TAG\"?( |$)")
+        done
     fi
     return 0
 }
@@ -822,25 +811,48 @@ apply_rules() {
     local m pub
 
     if [[ $LINK_TYPE == direct ]]; then
-        # no GRE/GRETAP interface: the core already binds TUN_IR_IP (the real
-        # public IP in this mode), so just open the control port directly.
-        # fw_accept_dport picks iptables/ip6tables based on TUN_IR_IP's family.
+        # Direct mode: open control port on TUN_IR_IP (Iran) and allow outbound/return on Kharej.
         if [[ $ROLE == iran ]]; then
-            if ctrl_is_udp; then
-                fw_accept_dport "$TUN_IR_IP" udp "$CTRL_PORT"
+            if [[ $CORE == frp && ( $PROTO == kcp || $PROTO == quic ) ]]; then
+                fw_accept_dst_dport "$TUN_IR_IP" udp "$CTRL_PORT"
+                fw_accept_dst_dport "$TUN_IR_IP" tcp "$CTRL_PORT"
+            elif ctrl_is_udp; then
+                fw_accept_dst_dport "$TUN_IR_IP" udp "$CTRL_PORT"
             else
-                fw_accept_dport "$TUN_IR_IP" tcp "$CTRL_PORT"
+                fw_accept_dst_dport "$TUN_IR_IP" tcp "$CTRL_PORT"
+            fi
+            if [[ $IP_VER == 6 ]]; then
+                ipt6_ensure filter INPUT -p icmpv6 -j ACCEPT
+            fi
+        else
+            if [[ $IP_VER == 6 ]]; then
+                ipt6_ensure filter INPUT -p icmpv6 -j ACCEPT
+                if ctrl_is_udp; then
+                    ipt6_ensure filter OUTPUT -d "$REMOTE_IP" -p udp --dport "$CTRL_PORT" -j ACCEPT
+                    ipt6_ensure filter INPUT  -s "$REMOTE_IP" -p udp --sport "$CTRL_PORT" -j ACCEPT
+                else
+                    ipt6_ensure filter OUTPUT -d "$REMOTE_IP" -p tcp --dport "$CTRL_PORT" -j ACCEPT
+                    ipt6_ensure filter INPUT  -s "$REMOTE_IP" -p tcp --sport "$CTRL_PORT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+                fi
+            else
+                if ctrl_is_udp; then
+                    ipt_ensure filter OUTPUT -d "$REMOTE_IP" -p udp --dport "$CTRL_PORT" -j ACCEPT
+                    ipt_ensure filter INPUT  -s "$REMOTE_IP" -p udp --sport "$CTRL_PORT" -j ACCEPT
+                else
+                    ipt_ensure filter OUTPUT -d "$REMOTE_IP" -p tcp --dport "$CTRL_PORT" -j ACCEPT
+                    ipt_ensure filter INPUT  -s "$REMOTE_IP" -p tcp --sport "$CTRL_PORT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+                fi
             fi
         fi
     else
-        # --- filter: let GRE from the peer in, and everything that rides on the tunnel.
-        # The raw GRE packet arrives as whatever the underlay is (REMOTE_IP's own family),
-        # so this one rule must run on the matching tool; everything else below is the
-        # DEcapsulated inner (always IPv4) traffic and always uses IPT4.
+        # GRE / GRETAP mode: allow outer protocol 47 (GRE) on underlay family + inner IPv4 traffic.
         if [[ $IP_VER == 6 ]]; then
-            ipt6_filter_ensure INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+            ipt6_ensure filter INPUT  -p icmpv6 -j ACCEPT
+            ipt6_ensure filter INPUT  -p 47 -s "$REMOTE_IP" -j ACCEPT
+            ipt6_ensure filter OUTPUT -p 47 -d "$REMOTE_IP" -j ACCEPT
         else
-            ipt_ensure filter INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+            ipt_ensure filter INPUT  -p 47 -s "$REMOTE_IP" -j ACCEPT
+            ipt_ensure filter OUTPUT -p 47 -d "$REMOTE_IP" -j ACCEPT
         fi
         ipt_ensure filter INPUT   -i "$IFACE" -j ACCEPT
         ipt_ensure filter FORWARD -i "$IFACE" -j ACCEPT
@@ -854,27 +866,18 @@ apply_rules() {
     fi
 
     if [[ $ROLE == iran ]]; then
+        # Forwarded ports listen dual-stack ([::]:pub or 0.0.0.0:pub) directly on the
+        # core server so both IPv4 and IPv6 clients are handled natively without NAT.
         for m in $PORTS; do
             pub=${m%%=*}
-            # traffic that arrives on the PUBLIC NIC and is DNATed to the tunnel IP
-            # is delivered locally: it needs its own INPUT accept (NOT covered by -i $IFACE).
-            # In Direct mode TUN_IR_IP already IS the public IP, so no DNAT is needed -
-            # the core's own listener already sits on that address.
             if [[ $FWD_TCP == 1 ]]; then
-                fw_accept_dport "$TUN_IR_IP" tcp "$pub"
-                if [[ $LINK_TYPE != direct ]]; then
-                    ipt_ensure nat PREROUTING ! -i "$IFACE" -m addrtype --dst-type LOCAL -p tcp --dport "$pub" -j DNAT --to-destination "$TUN_IR_IP:$pub"
-                fi
+                fw_accept_fwd_port tcp "$pub"
             fi
             if [[ $FWD_UDP == 1 ]]; then
-                fw_accept_dport "$TUN_IR_IP" udp "$pub"
-                if [[ $LINK_TYPE != direct ]]; then
-                    ipt_ensure nat PREROUTING ! -i "$IFACE" -m addrtype --dst-type LOCAL -p udp --dport "$pub" -j DNAT --to-destination "$TUN_IR_IP:$pub"
-                fi
+                fw_accept_fwd_port udp "$pub"
             fi
         done
         # tunnel traffic must never be touched by any other DNAT/REDIRECT rule on the box.
-        # Inserted last on purpose so it ends up FIRST in the chain. N/A in Direct mode.
         if [[ $LINK_TYPE != direct ]]; then
             ipt_ensure nat PREROUTING -i "$IFACE" -j ACCEPT
         fi
@@ -885,27 +888,55 @@ apply_rules() {
 
 has_self_ip() { ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet $SELF_IP/"; }
 
+has_direct_self_ip() {
+    if [[ $SELF_IP == *:* ]]; then
+        ip -6 addr show 2>/dev/null | grep -q "inet6 ${SELF_IP}/" && \
+            ! ip -6 addr show 2>/dev/null | grep "inet6 ${SELF_IP}/" | grep -q "tentative"
+    else
+        ip -4 addr show 2>/dev/null | grep -q "inet ${SELF_IP}/"
+    fi
+}
+
 case "$1" in
     up)
         purge_rules
+        # Allow dual-stack [::] sockets to accept both IPv4 and IPv6 connections.
+        if has_ipv6; then
+            sysctl -qw net.ipv6.bindv6only=0 2>/dev/null
+            [[ $IP_VER == 6 && $LINK_TYPE == direct ]] && sysctl -qw net.ipv6.ip_nonlocal_bind=1 2>/dev/null
+        fi
         if [[ $LINK_TYPE != direct ]]; then
+            modprobe gre 2>/dev/null
             modprobe ip_gre 2>/dev/null
-            [[ $IP_VER == 6 ]] && modprobe ip6_gre 2>/dev/null
+            if [[ $IP_VER == 6 ]]; then
+                modprobe ip6_tunnel 2>/dev/null
+                modprobe ip6_gre 2>/dev/null
+            fi
             ip link del "$IFACE" 2>/dev/null
             if [[ $IP_VER == 6 ]]; then
                 case $LINK_TYPE in gre) kind=ip6gre ;; *) kind=ip6gretap ;; esac
-                ttlkw=hoplimit
+                # encaplimit none strips the IPv6 DSTOPS extension header so Next Header
+                # is directly 47 (GRE) - critical for ip6tables matching and ISP firewalls.
+                if ! ip -6 link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" hoplimit 255 encaplimit none 2>/dev/null; then
+                    if ! ip -6 link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" hoplimit 255; then
+                        echo "ERROR: cannot create $IFACE (type $kind). Possible causes: IPv6 GRE support (ip6_gre/ip6_tunnel) is missing on this VPS/kernel," >&2
+                        echo "       LOCAL_IP $LOCAL_IP is not an address of this host, or another $kind tunnel with the same local/remote pair already exists." >&2
+                        exit 1
+                    fi
+                fi
             else
                 case $LINK_TYPE in gre) kind=gre ;; *) kind=gretap ;; esac
-                ttlkw=ttl
-            fi
-            if ! ip link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" $ttlkw 255; then
-                echo "ERROR: cannot create $IFACE (type $kind). Possible causes: GRE support (ip_gre/ip6_gre) is missing on this VPS/kernel," >&2
-                echo "       LOCAL_IP $LOCAL_IP is not an address of this host, or another $kind tunnel with the same local/remote pair already exists (another script?)." >&2
-                exit 1
+                if ! ip link add "$IFACE" type "$kind" local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255; then
+                    echo "ERROR: cannot create $IFACE (type $kind). Possible causes: GRE support (ip_gre) is missing on this VPS/kernel," >&2
+                    echo "       LOCAL_IP $LOCAL_IP is not an address of this host, or another $kind tunnel with the same local/remote pair already exists." >&2
+                    exit 1
+                fi
             fi
             ip addr add "$SELF_IP/$PFX" dev "$IFACE" || exit 1
             ip link set "$IFACE" mtu "$MTU_VAL" up || exit 1
+            # Linux uses max(all.rp_filter, iface.rp_filter) - both must be 0.
+            sysctl -qw "net.ipv4.conf.all.rp_filter=0" 2>/dev/null
+            sysctl -qw "net.ipv4.conf.default.rp_filter=0" 2>/dev/null
             sysctl -qw "net.ipv4.conf.$IFACE.rp_filter=0" 2>/dev/null
         fi
         apply_rules
@@ -934,9 +965,21 @@ case "$1" in
                 echo "ERROR: $IFACE has no $SELF_IP address" >&2
                 exit 1
             fi
+        elif [[ $ROLE == iran ]]; then
+            # Wait briefly for IPv6 DAD (tentative -> ready) on boot before binding
+            for _ in $(seq 1 15); do has_direct_self_ip && break; sleep 1; done
         fi
         if [[ $ROLE == kharej ]]; then
-            for _ in $(seq 1 10); do ping -c1 -W1 "$PEER_IP" >/dev/null 2>&1 && break; sleep 1; done
+            local tries=10
+            [[ $LINK_TYPE == direct ]] && tries=3
+            for _ in $(seq 1 "$tries"); do
+                if [[ $PEER_IP == *:* ]]; then
+                    ping -6 -c1 -W1 "$PEER_IP" >/dev/null 2>&1 && break
+                else
+                    ping -4 -c1 -W1 "$PEER_IP" >/dev/null 2>&1 && break
+                fi
+                sleep 1
+            done
         fi
         exit 0
         ;;
@@ -951,7 +994,7 @@ CTL_EOF
 }
 
 write_units() {
-    local s other_svc
+    local other_svc
     cat > "$UNIT_DIR/$LINK_SVC" <<EOF
 [Unit]
 Description=$LINK_LABEL tunnel and firewall rules (gre-tunnel-manager)
@@ -989,8 +1032,10 @@ WantedBy=multi-user.target
 EOF
 
     # clean up a leftover v4.0 (ini-based) FRP install, if any
-    systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
-    rm -f "$UNIT_DIR/$LEGACY_FRP_SVC"
+    if [[ $CORE_SVC != "$LEGACY_FRP_SVC" ]]; then
+        systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
+        rm -f "$UNIT_DIR/$LEGACY_FRP_SVC"
+    fi
 
     # only one core should auto-start: disable the OTHER core's unit, if it exists
     if [[ $CORE_SVC == "$BACKHAUL_SVC" ]]; then other_svc=$FRP_SVC; else other_svc=$BACKHAUL_SVC; fi
@@ -1183,9 +1228,15 @@ choose_ipver() {
     MENU_MAX=2
     ask_valid c "Select underlay IP version" "1" valid_menu "Enter 1 or 2."
     if (( 10#$c == 2 )); then IP_VER=6; else IP_VER=4; fi
-    if [[ $IP_VER == 6 ]] && ! command -v ip6tables >/dev/null 2>&1; then
-        err "ip6tables was not found (it normally ships together with iptables) - install it and run Setup again."
-        return 1
+    if [[ $IP_VER == 6 ]]; then
+        if ! has_ipv6; then
+            err "IPv6 appears disabled in the kernel on this host - enable IPv6 first."
+            return 1
+        fi
+        if ! command -v ip6tables >/dev/null 2>&1; then
+            err "ip6tables was not found (it normally ships together with iptables) - install it and run Setup again."
+            return 1
+        fi
     fi
 }
 
@@ -1262,7 +1313,7 @@ choose_profile() {
     set_profile_vars
 }
 
-prompt_ports() { # entered on Iran for Backhaul; on BOTH sides for FRP (see header notes)
+prompt_ports() { # entered on Iran for Backhaul; on BOTH sides for FRP
     local raw m pub conflicts msg
     while true; do
         msg="Ports to forward (e.g. 1080,443  -  use 8443=443 for public 8443 -> Kharej 443)"
@@ -1271,14 +1322,19 @@ prompt_ports() { # entered on Iran for Backhaul; on BOTH sides for FRP (see head
             err "Enter at least one valid port."
             continue
         fi
+        # Only Iran binds the public forwarded ports; on Kharej (FRP) the target
+        # service (Xray/SOCKS/...) is supposed to already listen on those ports.
+        if [[ $ROLE != iran ]]; then
+            return 0
+        fi
         conflicts=""
         for m in "${PORT_MAP[@]}"; do
             pub=${m%%=*}
             if [[ ${FWD_TCP:-1} == 1 ]]; then
-                conflicts+=$(listener_conflicts tcp "$pub" | sed "s/^/tcp $pub: /")$'\n'
+                conflicts+=$(listener_conflicts tcp "$pub" any | sed "s/^/tcp $pub: /")$'\n'
             fi
             if [[ ${FWD_UDP:-0} == 1 ]]; then
-                conflicts+=$(listener_conflicts udp "$pub" | sed "s/^/udp $pub: /")$'\n'
+                conflicts+=$(listener_conflicts udp "$pub" any | sed "s/^/udp $pub: /")$'\n'
             fi
         done
         conflicts=$(echo "$conflicts" | sed '/^$/d')
@@ -1305,7 +1361,7 @@ print_summary() {
     fi
     echo "  Core      : $CORE_NAME   protocol: $PROTO   profile: $PROFILE_LABEL"
     if [[ $LINK_TYPE != direct ]]; then
-        echo "  MTU/MSS   : $MTU_VAL / $MSS_VAL (fixed, same regardless of profile)"
+        echo "  MTU/MSS   : $MTU_VAL / $MSS_VAL (fixed for IPv$IP_VER, same regardless of profile)"
     fi
     if [[ $LINK_TYPE == direct ]]; then
         echo "  Control   : $(bracket_addr "$TUN_IR_IP"):$CTRL_PORT"
@@ -1314,6 +1370,9 @@ print_summary() {
     fi
     echo "  Token     : $TOKEN"
     if [[ -n ${PORTS:-} ]]; then
+        if [[ $ROLE == iran ]]; then
+            echo "  Fwd bind  : $(bracket_addr "${FWD_BIND_IP:-0.0.0.0}") (dual-stack IPv4+IPv6: $([[ ${FWD_BIND_IP:-} == "::" ]] && echo yes || echo IPv4-only))"
+        fi
         echo "  Ports     : ${PORTS// /, }   (TCP: $([[ ${FWD_TCP:-1} == 1 ]] && echo yes || echo no), UDP: $([[ ${FWD_UDP:-0} == 1 ]] && echo yes || echo no))"
     fi
     echo -e "${CYAN}-------------------------------------------------------------${NC}"
@@ -1357,6 +1416,8 @@ setup_tunnel() { # iran | kharej
     def_ip=$(detect_ip)
     ask_valid LOCAL_IP "Enter $lbl_local public IP" "$def_ip" "$ip_validator" "Not a valid IPv$IP_VER address."
     ask_valid REMOTE_IP "Enter $lbl_remote public IP" "" "$ip_validator" "Not a valid IPv$IP_VER address."
+    LOCAL_IP=$(canon_ip "$LOCAL_IP")
+    REMOTE_IP=$(canon_ip "$REMOTE_IP")
     if [[ $LOCAL_IP == "$REMOTE_IP" ]]; then
         err "Local and remote IP are identical."
         return 1
@@ -1421,8 +1482,11 @@ setup_tunnel() { # iran | kharej
     info "Stopping old services (their own stop hooks remove old firewall rules)..."
     stop_services
     # one-time cleanup of a v4.0 (ini-based) FRP install, if this box ever had one
-    systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
-    rm -f "$UNIT_DIR/$LEGACY_FRP_SVC" "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"
+    rm -f "$LEGACY_FRPS_BIN" "$LEGACY_FRPC_BIN"
+    if [[ $CORE_SVC != "$LEGACY_FRP_SVC" ]]; then
+        systemctl disable "$LEGACY_FRP_SVC" >/dev/null 2>&1
+        rm -f "$UNIT_DIR/$LEGACY_FRP_SVC"
+    fi
     systemctl daemon-reload
     rm -f "$CONFIG_DIR/gretap-up.sh" "$CONFIG_DIR/gretap-down.sh" \
           "$CONFIG_DIR/config.toml" "$CONFIG_DIR/frp.toml" "$CONFIG_DIR/frps.toml" "$CONFIG_DIR/frpc.toml"
@@ -1476,13 +1540,12 @@ ctrl_ok() {
     if ctrl_proto_is_udp; then (( udp > 0 )); else (( tcp > 0 )); fi
 }
 
-# instant check, no blocking wait: systemd (Restart=always) keeps retrying on
-# its own in the background regardless, so Setup hands control back right away
-# instead of sitting idle for up to 15-25 seconds like older versions did.
+# quick check without long blocking waits
 verify_setup() { # start_ts
     local ts=$1 log
+    sleep 1
     echo
-    info "Quick check (no wait - keep an eye on menu option 3 / 4 if this isn't confirmed yet)..."
+    info "Quick check (keep an eye on menu option 3 / 4 if this isn't confirmed yet)..."
     if [[ $ROLE == iran ]]; then
         if systemctl is-active -q "$CORE_SVC" && ctrl_ok; then
             res ok "$CORE_NAME server is listening on $(bracket_addr "$TUN_IR_IP"):$CTRL_PORT ($PROTO)"
@@ -1501,13 +1564,13 @@ verify_setup() { # start_ts
         res warn "Last log line(s) below - the client keeps retrying automatically:"
         grep -E "$LOG_ERR_RE" <<< "$log" | tail -n 3 | sed 's/^/        /'
         if grep -qi "refused" <<< "$log"; then
-            echo "    -> 'connection refused': the Iran $CORE_NAME server is not running/listening on $TUN_IR_IP:$CTRL_PORT."
+            echo "    -> 'connection refused': the Iran $CORE_NAME server is not running/listening on $(bracket_addr "$TUN_IR_IP"):$CTRL_PORT."
         elif grep -qi "token" <<< "$log"; then
             echo "    -> token mismatch: use the same token on both servers."
         elif grep -q "EOF" <<< "$log"; then
             echo "    -> 'EOF': TCP connects but the other end hangs up at once. Most common causes:"
             echo "       a) another program owns port $CTRL_PORT on the Iran server (Diagnose on Iran shows it)"
-            echo "       b) token or protocol differ between the two servers"
+            echo "       b) token, profile, or protocol differ between the two servers"
             echo "       c) the two servers run different binaries/versions (menu option 7)"
         elif grep -qiE "timeout|timed out" <<< "$log"; then
             echo "    -> timeouts: packets get lost inside the tunnel (MTU / GRE filtering, or a blocked path in Direct mode). Run Diagnose."
@@ -1552,10 +1615,10 @@ show_status() {
     if [[ $LINK_TYPE == direct ]]; then
         echo "  Control    : $(bracket_addr "$TUN_IR_IP"):$CTRL_PORT   (direct mode: no MTU/MSS clamp applied)"
     else
-        echo "  Control    : $TUN_IR_IP:$CTRL_PORT   MTU/MSS: $MTU_VAL/$MSS_VAL (fixed)"
+        echo "  Control    : $TUN_IR_IP:$CTRL_PORT   MTU/MSS: $MTU_VAL/$MSS_VAL (fixed for IPv$IP_VER)"
     fi
     if [[ -n ${PORTS:-} ]]; then
-        echo "  Forwarded  : $PORTS   (TCP: $([[ $FWD_TCP == 1 ]] && echo yes || echo no), UDP: $([[ $FWD_UDP == 1 ]] && echo yes || echo no))"
+        echo "  Forwarded  : $PORTS   (bind: $(bracket_addr "${FWD_BIND_IP:-0.0.0.0}"), TCP: $([[ $FWD_TCP == 1 ]] && echo yes || echo no), UDP: $([[ $FWD_UDP == 1 ]] && echo yes || echo no))"
     fi
 
     echo
@@ -1601,8 +1664,8 @@ show_status() {
     for t in filter nat mangle; do
         iptables -t "$t" -S 2>/dev/null | grep -- "--comment" | grep BHGT | sed "s/-m comment --comment \"\\?BHGT\"\\? //; s/^/    [$t] /"
     done
-    if [[ $IP_VER == 6 ]] && command -v ip6tables >/dev/null 2>&1; then
-        for t in filter; do
+    if command -v ip6tables >/dev/null 2>&1; then
+        for t in filter nat mangle; do
             ip6tables -t "$t" -S 2>/dev/null | grep -- "--comment" | grep BHGT | sed "s/-m comment --comment \"\\?BHGT\"\\? //; s/^/    [ip6 $t] /"
         done
     fi
@@ -1638,20 +1701,24 @@ diagnose() {
             res bad "ping $PEER_IP fails: check that $CTRL_PORT (and the forwarded ports) are reachable; the peer may simply block ICMP even if the tunnel itself works"
         fi
     elif ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet $SELF_IP/"; then
-        res ok "$IFACE has $SELF_IP (mtu $(cat /sys/class/net/$IFACE/mtu 2>/dev/null))"
+        local cur_mtu max_pl
+        cur_mtu=$(cat "/sys/class/net/$IFACE/mtu" 2>/dev/null || echo "$MTU_VAL")
+        max_pl=$((cur_mtu - 28))
+        res ok "$IFACE has $SELF_IP (mtu $cur_mtu)"
         if ! ip -d link show "$IFACE" 2>/dev/null | grep -q "remote $REMOTE_IP"; then
             res warn "$IFACE does not point at remote $REMOTE_IP (wrong peer IP, or the link type differs from the other server)"
         fi
         if ping_peer "$PEER_IP" -c 2 -W 2 >/dev/null 2>&1; then
             res ok "ping $PEER_IP works"
             local sz best=0
-            for sz in 1372 1340 1300 1240 1200 1100 1000; do
-                if ping -M "do" -c 1 -W 2 -s "$sz" "$PEER_IP" >/dev/null 2>&1; then best=$sz; break; fi
+            for sz in "$max_pl" 1340 1300 1240 1200 1100 1000; do
+                (( sz > max_pl )) && continue
+                if ping -4 -M "do" -c 1 -W 2 -s "$sz" "$PEER_IP" >/dev/null 2>&1; then best=$sz; break; fi
             done
-            if (( best == 1372 )); then
-                res ok "full-size packets (mtu 1400) pass without fragmentation"
+            if (( best == max_pl )); then
+                res ok "full-size packets (mtu $cur_mtu) pass without fragmentation"
             elif (( best > 0 )); then
-                res warn "largest unfragmented ping payload is $best (< 1372): the real path MTU is below 1400 -> lower MTU_VAL/MSS_VAL"
+                res warn "largest unfragmented ping payload is $best (< $max_pl): real path MTU is below $cur_mtu -> lower MTU_VAL"
             else
                 res bad "even 1000-byte DF pings are lost: MTU black hole or GRE filtering for larger packets"
             fi
@@ -1662,7 +1729,7 @@ diagnose() {
         res bad "$IFACE missing or has no $SELF_IP"
     fi
 
-    local m pub owners proto fl
+    local m pub owners proto fl bind_list
     if [[ $ROLE == iran ]]; then
         echo -e "\n${CYAN}4) Control port $CTRL_PORT on this server${NC}"
         owners=$(ss -H -ltunp "sport = :$CTRL_PORT" 2>/dev/null)
@@ -1679,22 +1746,28 @@ diagnose() {
             echo "      -> stop that program or run setup again with a different control port."
         fi
 
-        echo -e "\n${CYAN}5) Forwarded ports${NC}"
+        echo -e "\n${CYAN}5) Forwarded ports (dual-stack IPv4 + IPv6)${NC}"
         for m in $PORTS; do
             pub=${m%%=*}
             for proto in tcp udp; do
                 [[ $proto == tcp && $FWD_TCP != 1 ]] && continue
                 [[ $proto == udp && $FWD_UDP != 1 ]] && continue
                 fl="-ltnpH"; [[ $proto == udp ]] && fl="-lunpH"
-                if [[ $LINK_TYPE == direct ]]; then
-                    res ok "direct mode: no DNAT rule is needed for port $pub (checking the listener only)"
-                elif iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-p $proto .*--dport $pub .*BHGT"; then
-                    res ok "$proto DNAT rule for port $pub present"
+                if iptables -t filter -S INPUT 2>/dev/null | grep -q -- "-p $proto .*--dport $pub .*BHGT"; then
+                    res ok "IPv4 firewall ACCEPT rule for $proto port $pub present"
                 else
-                    res bad "$proto DNAT rule for port $pub missing (menu 6 to reload)"
+                    res bad "IPv4 firewall ACCEPT rule for $proto port $pub missing (menu 6 to reload)"
                 fi
-                if ss $fl "sport = :$pub" 2>/dev/null | grep -q "$CORE_PROC"; then
-                    res ok "$CORE_NAME listens on $proto port $pub"
+                if has_ipv6 && command -v ip6tables >/dev/null 2>&1; then
+                    if ip6tables -t filter -S INPUT 2>/dev/null | grep -q -- "-p $proto .*--dport $pub .*BHGT"; then
+                        res ok "IPv6 firewall ACCEPT rule for $proto port $pub present"
+                    else
+                        res bad "IPv6 firewall ACCEPT rule for $proto port $pub missing (menu 6 to reload)"
+                    fi
+                fi
+                bind_list=$(ss $fl "sport = :$pub" 2>/dev/null | grep "$CORE_PROC" | awk '{print $4}' | paste -sd, -)
+                if [[ -n $bind_list ]]; then
+                    res ok "$CORE_NAME listens on $proto port $pub ($bind_list)"
                 elif [[ -n $(ss $fl "sport = :$pub" 2>/dev/null) ]]; then
                     res bad "$proto port $pub is held by another program: $(ss $fl "sport = :$pub" | awk '{print $6}' | head -n1)"
                 else
@@ -1714,9 +1787,9 @@ diagnose() {
             timeout 3 bash -c "exec 3<>/dev/tcp/$PEER_IP/$CTRL_PORT" 2>/dev/null
             rc=$?
             case $rc in
-                0)   res warn "TCP connect to $PEER_IP:$CTRL_PORT works but no tunnel is established -> the program there hangs up (port owner / token / protocol / binary mismatch). Run Diagnose on the IRAN server." ;;
-                124) res bad "TCP connect to $PEER_IP:$CTRL_PORT TIMED OUT (packets dropped: MTU/firewall, or a blocked path in Direct mode)" ;;
-                *)   res bad "TCP connect to $PEER_IP:$CTRL_PORT REFUSED: nothing listens there (Iran $CORE_NAME not running / different port)" ;;
+                0)   res warn "TCP connect to $(bracket_addr "$PEER_IP"):$CTRL_PORT works but no tunnel is established -> the program there hangs up (port owner / token / protocol / profile / binary mismatch). Run Diagnose on the IRAN server." ;;
+                124) res bad "TCP connect to $(bracket_addr "$PEER_IP"):$CTRL_PORT TIMED OUT (packets dropped: MTU/firewall, or a blocked path in Direct mode)" ;;
+                *)   res bad "TCP connect to $(bracket_addr "$PEER_IP"):$CTRL_PORT REFUSED: nothing listens there (Iran $CORE_NAME not running / different port)" ;;
             esac
         fi
         echo
@@ -1752,7 +1825,7 @@ diagnose() {
     echo -e "\n${CYAN}How to read common errors${NC}"
     echo "    'failed to read message length ... EOF' on the Kharej client: the TCP connection worked, then the other end"
     echo "    closed it at once. With matching tokens the thing answering is not your core server (port owner, see Iran"
-    echo "    step 4), uses another protocol, or is a different build (compare sha256 in step 1 on both servers)."
+    echo "    step 4), uses another protocol/profile, or is a different build (compare sha256 in step 1 on both servers)."
     echo -e "${CYAN}======================================================${NC}\n"
 }
 
@@ -1809,7 +1882,8 @@ follow_log() {
 }
 
 uninstall_all() {
-    local b
+    local b t line
+    local -a words=()
     echo
     warn "This removes the tunnel, services, firewall rules and config of THIS tunnel only."
     ask_yn "Really uninstall?" n || return 0
@@ -1819,6 +1893,25 @@ uninstall_all() {
         pkill -f -- "$b -c $CONFIG_DIR/" 2>/dev/null
     done
     [[ -x $CTL_SH ]] && "$CTL_SH" down
+    # fallback firewall cleanup in case tunnel.conf was missing/corrupt
+    for t in filter nat mangle; do
+        while read -r line; do
+            [[ -n $line ]] || continue
+            line=${line//\"/}
+            line="-D${line#-A}"
+            read -ra words <<< "$line"
+            iptables -t "$t" "${words[@]}" 2>/dev/null
+        done < <(iptables -t "$t" -S 2>/dev/null | grep -E -- "--comment \"?BHGT\"?( |$)")
+        if command -v ip6tables >/dev/null 2>&1; then
+            while read -r line; do
+                [[ -n $line ]] || continue
+                line=${line//\"/}
+                line="-D${line#-A}"
+                read -ra words <<< "$line"
+                ip6tables -t "$t" "${words[@]}" 2>/dev/null
+            done < <(ip6tables -t "$t" -S 2>/dev/null | grep -E -- "--comment \"?BHGT\"?( |$)")
+        fi
+    done
     rm -f "$UNIT_DIR/$BACKHAUL_SVC" "$UNIT_DIR/$FRP_SVC" "$UNIT_DIR/$LEGACY_FRP_SVC" "$UNIT_DIR/$LINK_SVC"
     systemctl daemon-reload
     ip link del gretun1 2>/dev/null
